@@ -1,8 +1,108 @@
-# AR Learning Assistant
+# 🎓 ResFes AR Learning Assistant (ResFes 2026)
 
-An AI-powered learning tool that analyzes textbook images and provides Socratic guidance to help students think through problems — without giving direct answers.
+> **AI-powered AR learning tool với Socratic method**  
+> Scan bài tập → Nhận gợi ý thông minh (KHÔNG đưa đáp án)
 
-Built for **ResFes 2026** as a research prototype under the *Information Technology* track.
+Built for **ResFes 2026** — sẵn sàng chuyển lên kính AR thật.
+
+---
+
+## 🏗️ Kiến trúc 2-app
+
+### 📱 KB Server (điện thoại)
+- Python Flask app đơn giản - chạy được trên Termux/Pydroid
+- Upload & lưu trữ tài liệu học tập (PDF, TXT, images)
+- Cung cấp API search cho ResFes
+- **Port:** 5001
+
+### 🥽 ResFes Web App (kính AR / laptop)
+- Camera + Gesture control (MediaPipe) - điều khiển bằng tay
+- Groq LLaMA 4 Scout AI - phân tích ảnh & Socratic hints
+- Kết nối KB Server để tìm kiến thức liên quan từ tài liệu
+- **Port:** 5050
+
+### 🔗 Workflow
+```
+Kính AR/Phone → ResFes → Groq AI (Vision) → Socratic hint
+                  ↓
+              KB Server (Phone) → Search tài liệu → Knowledge snippets
+```
+
+---
+
+## ⚡ Quick Start
+
+### 1. Setup KB Server (điện thoại)
+
+**Termux (Android):**
+```bash
+pkg install python
+pip install flask flask-cors
+python kb_server.py
+```
+
+**Pydroid 3 (Android):**
+1. Install from Play Store
+2. Menu → Pip → Install: `flask flask-cors`
+3. Open `kb_server.py` → Run ▶️
+
+→ Server chạy tại: `http://<phone-ip>:5001`
+
+### 2. Setup ResFes (laptop/kính)
+
+```bash
+pip install flask flask-cors groq python-dotenv pyOpenSSL requests
+python resfes.py
+```
+
+**Tạo file `.env`:**
+```bash
+GROQ_API_KEY=your_groq_api_key_here
+KB_SERVER_URL=http://192.168.1.XXX:5001  # Thay XXX bằng IP điện thoại
+```
+
+→ Server chạy tại: `https://localhost:5050`
+
+### 3. Sử dụng
+
+1. **Upload tài liệu** qua KB Server: Mở `http://<phone-ip>:5001`
+   - Click upload → Chọn PDF/TXT → Chọn môn học → Upload
+2. **Mở ResFes** trên kính/điện thoại khác: `https://<laptop-ip>:5050`
+3. **Scan bài tập** bằng cử chỉ tay ✌️ (Victory)
+4. **Nhận kết quả**: 
+   - OCR text đọc được
+   - Socratic hint (câu hỏi gợi mở)
+   - 📚 Knowledge từ tài liệu liên quan
+
+---
+
+## 🎯 Tính năng
+
+### 📸 Camera + Gesture Control
+- Camera điện thoại/kính AR (rear camera)
+- Điều khiển 100% bằng cử chỉ tay (MediaPipe):
+  - ☝️ **Pointing** → Di chuyển cursor
+  - 🤏 **Pinch** → Click/bấm nút
+  - 🖐️ **Open Palm** → Bật mic
+  - ✌️ **Victory** → Scan ngay
+
+### 🤖 AI Vision + Socratic Method
+- Groq LLaMA 4 Scout (multimodal 17B)
+- OCR text/công thức toán từ ảnh
+- Tự động nhận diện môn học
+- **Chỉ đưa câu hỏi gợi mở, KHÔNG đưa đáp án**
+- TTS đọc gợi ý (tiếng Việt)
+
+### 🎤 Voice Control
+- Wake word: "**Hey ResFes**"
+- STT tiếng Việt (Web Speech API)
+- Hỏi bằng giọng nói
+
+### 📚 Knowledge Base
+- Upload tài liệu học tập (PDF, TXT, images)
+- Tự động tìm kiến thức liên quan khi scan
+- Lưu trữ local trên điện thoại
+- Simple RAG search (có thể nâng cấp thành smart RAG với Groq)
 
 ---
 

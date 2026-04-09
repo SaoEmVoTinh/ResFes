@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Test - HTTPS</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+            background: #f5f5f5;
+        }
+        h1 { color: #333; }
+        .status {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .ok { background: #d4edda; color: #155724; }
+        .err { background: #f8d7da; color: #721c24; }
+        .info { background: #d1ecf1; color: #0c5460; }
+        video {
+            width: 100%;
+            max-width: 640px;
+            border: 2px solid #333;
+            margin: 20px 0;
+            display: none;
+        }
+        video.active { display: block; }
+        button {
+            padding: 15px 30px;
+            font-size: 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover { background: #0056b3; }
+        #console {
+            background: #222;
+            color: #0f0;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            margin: 20px 0;
+        }
+        .log-item {
+            margin: 5px 0;
+            padding: 3px;
+        }
+        .log-error { color: #f88; }
+        .log-warn { color: #ff0; }
+        .log-info { color: #0ff; }
+    </style>
+</head>
+<body>
+    <h1>🎥 Camera Permission Test</h1>
+    
+    <div id="protocol-check" class="status info">
+        Đang kiểm tra protocol...
+    </div>
+    
+    <div id="https-check" class="status info">
+        Đang kiểm tra HTTPS...
+    </div>
+    
+    <div id="status" class="status info">
+        Chưa bắt đầu test
+    </div>
+    
+    <button onclick="testCamera()">🚀 Test Camera</button>
+    <button onclick="clearConsole()">🧹 Clear Console</button>
+    
+    <video id="video" autoplay playsinline muted></video>
+    
+    <h3>📝 Console Log:</h3>
+    <div id="console"></div>
+    
+    <h3>ℹ️ Debug Info:</h3>
+    <ul id="debug-info"></ul>
+
+    <script>
+        const video = document.getElementById('video');
+        const statusDiv = document.getElementById('status');
+        const consoleDiv = document.getElementById('console');
+        const debugInfo = document.getElementById('debug-info');
+        
+        // Log to custom console
+        function log(msg, type = 'info') {
+            const item = document.createElement('div');
+            item.className = `log-item log-${type}`;
+            item.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            consoleDiv.appendChild(item);
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+            console.log(msg);
+        }
+        
+        function clearConsole() {
+            consoleDiv.innerHTML = '';
+        }
+        
+        function setStatus(msg, type = 'info') {
+            statusDiv.textContent = msg;
+            statusDiv.className = `status ${type}`;
+        }
+        
+        // Check protocol
+        function checkProtocol() {
+            const protocol = window.location.protocol;
+            const hostname = window.location.hostname;
+            const protocolDiv = document.getElementById('protocol-check');
+            
+            log(`Protocol: ${protocol}`);
+            log(`Hostname: ${hostname}`);
+            
+            if (protocol === 'https:') {
+                protocolDiv.textContent = '✅ HTTPS detected';
+                protocolDiv.className = 'status ok';
+            } else if (protocol === 'http:') {
+                if (hostname === 'localhost' || hostname === '127.0.0.1') {
+                    protocolDiv.textContent = '⚠️ HTTP but localhost (should work)';
+                    protocolDiv.className = 'status info';
+                } else {
+                    protocolDiv.textContent = '❌ HTTP on network (camera will FAIL)';
+                    protocolDiv.className = 'status err';
+                }
+            }
+        }
+        
+        // Check HTTPS security
+        function checkHTTPS() {
+            const httpsDiv = document.getElementById('https-check');
+            
+            if (window.isSecureContext) {
+                httpsDiv.textContent = '✅ Secure context - camera allowed';
+                httpsDiv.className = 'status ok';
+                log('✅ isSecureContext = true');
+            } else {
+                httpsDiv.textContent = '❌ NOT secure context - camera BLOCKED';
+                httpsDiv.className = 'status err';
+                log('❌ isSecureContext = false', 'error');
+            }
+        }
+        
+        // Debug info
+        function showDebugInfo() {
+            const info = [
+                `User Agent: ${navigator.userAgent}`,
+                `Platform: ${navigator.platform}`,
+                `Language: ${navigator.language}`,
+                `Online: ${navigator.onLine}`,
+                `mediaDevices available: ${!!navigator.mediaDevices}`,
+                `getUserMedia available: ${!!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)}`,
+                `Secure Context: ${window.isSecureContext}`,
+                `Location: ${window.location.href}`
+            ];
+            
+            debugInfo.innerHTML = info.map(i => `<li>${i}</li>`).join('');
+            info.forEach(i => log(i));
+        }
+        
+        // Test camera
+        async function testCamera() {
+            log('🎬 Starting camera test...', 'info');
+            setStatus('Đang yêu cầu quyền camera...', 'info');
+            
+            try {
+                // Check if getUserMedia is available
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('getUserMedia không được hỗ trợ trên browser này');
+                }
+                
+                log('📸 Requesting camera permission...');
+                
+                const constraints = {
+                    video: {
+                        facingMode: { ideal: 'environment' },
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    },
+                    audio: false
+                };
+                
+                log(`Constraints: ${JSON.stringify(constraints, null, 2)}`);
+                
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                
+                log('✅ Camera permission GRANTED!', 'info');
+                setStatus('✅ Camera đã được cấp quyền!', 'ok');
+                
+                video.srcObject = stream;
+                video.classList.add('active');
+                await video.play();
+                
+                log(`Video track: ${stream.getVideoTracks()[0].label}`);
+                log(`Video settings: ${JSON.stringify(stream.getVideoTracks()[0].getSettings(), null, 2)}`);
+                
+            } catch (error) {
+                log(`❌ ERROR: ${error.name}`, 'error');
+                log(`Message: ${error.message}`, 'error');
+                log(`Stack: ${error.stack}`, 'error');
+                
+                setStatus(`❌ Lỗi: ${error.message}`, 'err');
+                
+                // Specific error handling
+                if (error.name === 'NotAllowedError') {
+                    log('⚠️ User DENIED camera permission', 'warn');
+                } else if (error.name === 'NotFoundError') {
+                    log('⚠️ No camera found on device', 'warn');
+                } else if (error.name === 'NotSupportedError') {
+                    log('⚠️ Camera not supported on this browser', 'warn');
+                } else if (error.name === 'NotReadableError') {
+                    log('⚠️ Camera is being used by another app', 'warn');
+                } else if (error.name === 'SecurityError') {
+                    log('⚠️ SECURITY ERROR - likely HTTPS issue', 'error');
+                }
+            }
+        }
+        
+        // Run checks on load
+        window.addEventListener('load', () => {
+            log('🚀 Page loaded');
+            checkProtocol();
+            checkHTTPS();
+            showDebugInfo();
+            log('👉 Click "Test Camera" button to start');
+        });
+        
+        // Capture original console errors
+        window.addEventListener('error', (e) => {
+            log(`💥 JS Error: ${e.message} at ${e.filename}:${e.lineno}`, 'error');
+        });
+        
+        window.addEventListener('unhandledrejection', (e) => {
+            log(`💥 Unhandled Promise: ${e.reason}`, 'error');
+        });
+    </script>
+</body>
+</html>

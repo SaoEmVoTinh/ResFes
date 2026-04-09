@@ -1,5 +1,9 @@
 groq
 flask
 flask-cors
+requests
 python-dotenv
 Pillow
+colorama
+pyOpenSSL
+kivy

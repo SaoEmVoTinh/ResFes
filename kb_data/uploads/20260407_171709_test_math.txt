@@ -1,0 +1,37 @@
+KIẾN THỨC TOÁN HỌC - ĐẠO HÀM
+
+1. ĐỊNH NGHĨA ĐẠO HÀM
+Đạo hàm của hàm số f(x) tại điểm x₀ là:
+f'(x₀) = lim[h→0] (f(x₀ + h) - f(x₀)) / h
+
+2. CÁC QUY TẮC ĐẠO HÀM CƠ BẢN
+• (c)' = 0  (c là hằng số)
+• (xⁿ)' = n·xⁿ⁻¹
+• (√x)' = 1/(2√x)
+• (1/x)' = -1/x²
+
+3. QUY TẮC TÍNH
+• (u + v)' = u' + v'
+• (u·v)' = u'·v + u·v'
+• (u/v)' = (u'·v - u·v')/v²
+• (uⁿ)' = n·uⁿ⁻¹·u'
+
+4. ĐẠO HÀM HÀM SỐ LƯỢNG GIÁC
+• (sin x)' = cos x
+• (cos x)' = -sin x
+• (tan x)' = 1/cos²x = 1 + tan²x
+• (cot x)' = -1/sin²x = -(1 + cot²x)
+
+5. ĐẠO HÀM HÀM SỐ MŨ VÀ LOGARIT
+• (eˣ)' = eˣ
+• (aˣ)' = aˣ·ln a
+• (ln x)' = 1/x
+• (logₐ x)' = 1/(x·ln a)
+
+6. VÍ DỤ ÁP DỤNG
+Tính đạo hàm của y = x³ + 2x² - 5x + 1
+y' = 3x² + 4x - 5
+
+Tính đạo hàm của y = sin(2x)
+Đặt u = 2x, suy ra u' = 2
+y' = cos(2x)·2 = 2cos(2x)
