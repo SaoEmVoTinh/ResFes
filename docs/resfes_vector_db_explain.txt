@@ -1,5 +1,8 @@
 Tài liệu: Giải thích `resfes.py` và `vector_db.py`
 
+Last updated: 2026-04-29 — updated to match README link and minor clarifications
+
+
 Mục đích chung
 - `resfes.py`: Backend Flask cho DALAP AR — xử lý upload tài liệu, RAG (retrieval + generation), OCR/analyze, chat/quiz, quản lý session, và chạy server (HTTP/HTTPS). Tập trung vào chạy nhẹ trên desktop/Android (Chaquopy).
 - `vector_db.py`: Lớp `SQLiteVectorDB` cung cấp embedding "hash" nhẹ và lưu/tra cứu vector trong SQLite để hỗ trợ retrieval khi có enable.
