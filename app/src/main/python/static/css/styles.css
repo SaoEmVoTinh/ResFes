@@ -1,0 +1,11 @@
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --teal:#52d9c1;--teal-bg:rgba(82,217,193,0.14);--teal-border:rgba(82,217,193,0.28);
+  --blue:#5b7cf6;--blue2:#7c9bff;
+  --green:#3fcf8e;--red:#f06060;--amber:#f5a623;
+  --surface:rgba(8,14,26,0.84);
+  --text:#e8edf5;--text2:#8b90a8;--text3:#444c62;
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:var(--font);color:var(--text)}
+/* ... (phần CSS đầy đủ đã copy) ... */

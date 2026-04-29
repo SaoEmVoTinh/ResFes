@@ -1,0 +1,143 @@
+Tài liệu: Giải thích `resfes.py` và `vector_db.py`
+
+Mục đích chung
+- `resfes.py`: Backend Flask cho DALAP AR — xử lý upload tài liệu, RAG (retrieval + generation), OCR/analyze, chat/quiz, quản lý session, và chạy server (HTTP/HTTPS). Tập trung vào chạy nhẹ trên desktop/Android (Chaquopy).
+- `vector_db.py`: Lớp `SQLiteVectorDB` cung cấp embedding "hash" nhẹ và lưu/tra cứu vector trong SQLite để hỗ trợ retrieval khi có enable.
+
+File: resfes.py — cấu trúc và vai trò từng phần
+1) Cấu hình & environment
+- `_load_env()` và `_get_data_dir()`: tải `.env` và xác định thư mục lưu dữ liệu phù hợp cả desktop/Chaquopy.
+- Biến cấu hình (CHUNK_SIZE, VECTOR_DIM, API_KEY, v.v.) lấy từ env với giá trị mặc định.
+- Lý do: tách cấu hình giúp deploy đa nền tảng và dễ tinh chỉnh.
+
+2) Khởi tạo Groq client
+- `_init_groq_client()` khởi tạo `Groq(api_key=...)`. Nếu không có key thì client=None và nhiều endpoint sẽ fallback.
+- Lý do: cho phép chạy offline/limited mode (safe mode) nếu không có API key.
+
+3) Database (SQLite)
+- `_open_db_connection()` + `get_db()` + `close_db()`: mở kết nối SQLite request-scoped (lưu vào `flask.g`) hoặc tạo connection mới nếu không có app context.
+- PRAGMA: `busy_timeout`, `foreign_keys=ON`, `journal_mode=WAL` để cải thiện đồng thời/độ bền.
+- `init_db()` tạo schema bảng `documents`, `chunks`, `sessions`, `session_turns`.
+- Lý do: SQLite là lựa chọn đơn giản, không cần server, phù hợp cho app cục bộ/Chaquopy.
+
+4) Vector DB
+- Nếu `VECTOR_DB_ENABLED`, tạo `SQLiteVectorDB` (từ `vector_db.py`) và gọi `init_schema()`.
+- Lý do: optional, để có thể dùng retrieval vector khi tài nguyên cho phép.
+
+5) RAG pipeline (chủ yếu text-based retrieval)
+- `split_chunks()`: chia văn bản thành chunks có overlap, ưu tiên cắt theo câu/đoạn.
+  - Tại sao: chunk nhỏ, overlap giúp giữ ngữ cảnh khi query cắt rời.
+- Tokenize và stopword: `_tokenize()` dùng regex đơn giản và bộ stopword tiếng Việt để giảm noise.
+- TF-IDF: `_build_tfidf()`, `_tfidf_vec()`, `_cosine()`.
+- BM25: `_bm25_score()` để xử lý tốt khi chunk khác chiều dài.
+- RRF fusion: `_rrf_fuse()` để kết hợp nhiều ranker (tfidf + bm25 + optional vector).
+  - Tại sao hybrid: khi không có embedding chất lượng, TF-IDF + BM25 là giải pháp đáng tin cậy, nhanh và không cần GPU.
+
+6) Cache nội bộ
+- `_vec_cache` + `_ensure_cache()` rebuild toàn bộ index TF-IDF/BM25 từ DB khi dirty.
+- Lý do: tránh tính toán lại cho mỗi truy vấn; trade-off là tiêu thụ RAM. (Cache hiện không giới hạn.)
+
+7) Query expansion
+- `_expand_query()` gọi Groq để paraphrase query (max 2 biến thể) để tăng recall.
+- Lý do: cải thiện khả năng match khi học sinh đặt câu hỏi khác cách diễn đạt.
+
+8) semantic_search()
+- Nếu `vector_db` tồn tại → ưu tiên vector search (embedding similarity).
+- Ngược lại dùng hybrid TF-IDF+BM25 + RRF, có thể expand query.
+- Kết quả trả về kèm score, tfidf_score, bm25_score.
+- Lý do: tận dụng vector retrieval khi khả dụng, fallback sang lightweight retrieval nếu không có vector.
+
+9) Ingest & extractor
+- `_infer_file_type()`, `_extract_text()`: cố gắng đọc nhiều định dạng (txt, pdf, docx, xlsx, pptx, image) bằng thư viện local; trên Android ưu tiên gọi extractor remote nếu local parser không có.
+- `ingest_document()`: lưu file, chèn document và chunks vào DB, cập nhật vector_db nếu có.
+- Lý do: tách xử lý format, cho phép fallback remote extractor vì môi trường Chaquopy thiếu nhiều package.
+
+10) Generation / Agentic pipeline
+- `generate_answer()` gọi Groq với context gồm các đoạn đã retrieve, ép model bám nguồn.
+- `generate_answer_agentic()` thực hiện pipeline: nhiều filter agent (summarizer, extractor, reasoner) → answer agents → synthesis agent. Mỗi bước cố gắng buộc model trả JSON có cấu trúc.
+- Lý do: tăng chất lượng/độ an toàn của trả lời bằng cách cho model các vai trò nhỏ, dễ kiểm soát.
+
+11) Rate limiting & quota
+- `_rate_limit_lock` + các hàm `_analyze_rate_limited`, `_endpoint_rate_limited`, `_hourly_quota_check` đảm bảo giới hạn tần suất (per-IP, per-endpoint) an toàn cho multi-thread.
+- Lý do: bảo vệ tài nguyên local và API giới hạn.
+
+12) Endpoints quan trọng
+- `/analyze`: gửi ảnh base64 tới Groq (image+prompt) để sinh OCR + Socratic hints, kèm RAG lookup.
+- `/ask`: RAG QA pipeline (agentic optional).
+- `/kb/*`: upload/list/manage documents & chunks.
+- `/chat`, `/chat/stream`: chat có thể stream, có chế độ safe mode (ANDROID_SAFE_CHAT) dùng extractive fallback.
+- `/quiz`: tạo quiz grounded vào nguồn.
+- Lý do: tập trung UX cho học tập AR (scan → suggest → QA/quiz).
+
+13) HTTPS cert management
+- Tạo self-signed cert nếu cần, dùng `cryptography` hoặc bundled cert khi thiếu.
+- Lý do: hỗ trợ camera access (HTTPS) trên mobile/tunnel.
+
+Vấn đề/điểm cần lưu ý (tôi đã review mã nguồn):
+- Cache không giới hạn: `_vec_cache` và `_EXPAND_CACHE` không có giới hạn TTL/size → có thể tăng bộ nhớ theo số docs/queries.
+- `_ensure_cache()` rebuild toàn bộ cache đọc toàn bộ `chunks` table; với DB lớn có thể tốn thời gian/memory.
+- `_expand_query()` gọi LLM tuyến tính (latency + cost); được cache nhưng cache unbounded.
+- `ingest_document()` lưu file vào `UPLOAD_DIR` bằng `filename` time-based mà không xóa cũ tự động; có thể đầy ổ.
+- Vector embeddings được lưu dưới dạng JSON string (nhiều bytes); chèn hàng loạt tốt, nhưng DB size có thể tăng nhanh.
+- `analyze()` và một số nơi parse JSON trả về từ LLM bằng regex/fallback; robust nhưng vẫn có rủi ro nếu LLM trả text không mong muốn.
+- Nếu `API_KEY` không set nhưng `ALLOW_OPEN_API` true → server mở public (đã cảnh báo) — lưu ý bảo mật.
+
+File: vector_db.py — cấu trúc và lý do chọn giải pháp
+1) `HashEmbedding`
+- Triển khai embedding "hashing trick": băm token bằng `blake2b` rồi gán vào buckets, có dấu (+/-) và trọng số theo vị trí, cuối cùng chuẩn hóa.
+- Lý do: tránh phụ thuộc vào mô hình embedding nặng; suitable cho on-device, deterministic, nhanh.
+- Hạn chế: chất lượng semantic thấp hơn embeddings học được; nhưng hữu ích làm fallback hoặc khi tài nguyên không có.
+
+2) `SQLiteVectorDB`
+- Lưu embedding (JSON) vào table `chunk_vectors` cùng `chunk_id`, `doc_id`, `subject`, `dim`, `model_name`, `updated_at`.
+- `upsert_document_chunks()` dùng ON CONFLICT(chunk_id) DO UPDATE để duy trì sync với chunks table.
+- `search()` đọc tất cả vector (hoặc subject-filtered) từ DB, tính điểm dot(q, v) tại client, duy trì heap top-k.
+- Lý do: tránh phụ thuộc trên extension SQLite (sqlite3 + FTS + vector extension). Thiết kế đơn giản, portable, không cần native module.
+- Hạn chế: đọc tất cả hàng của `chunk_vectors` khiến truy vấn chậm khi dataset lớn; không tận dụng index vector nhanh (ANN).
+
+Những lỗi/bug rõ ràng tôi nhận thấy
+- Không có lỗi cú pháp hay lỗi khởi động rõ rệt trong hai file.
+- Các nguy cơ runtime:
+  - OOM hoặc chậm khi có nhiều chunks (do cache và vector search hiện tại đọc toàn bộ rows).
+  - Cache growth và _EXPAND_CACHE không bị giới hạn.
+  - Nếu `EXTRACTOR_SERVER_URL` không ổn định, ingest sẽ return placeholder strings và không index — hiện code đã xử lý fallback.
+
+Gợi ý cải tiến ngắn gọn
+- Thêm giới hạn cache: max entries / TTL cho `_vec_cache` và `_EXPAND_CACHE`.
+- Rebuild cache incremental: track changes (last_indexed_max_chunk_id) thay vì read-all.
+- Với dataset lớn: tích hợp ANN library hoặc SQLite+extension (pgvector / sqlite-vector-extension) để search nhanh hơn.
+- Lưu embedding ở dạng BLOB nhị phân (float32) nếu cần tiết kiệm không gian/IO.
+- Cleanup uploads: script / endpoint để xoá file cũ và compact DB.
+- Giới hạn kích thước `_ANALYZE_IMAGE_MAX_CHARS` là cần, nhưng cân nhắc validate file type trước decode base64.
+- Thêm monitoring/metrics cho số LLM calls (cost control).
+
+Nên nâng cấp dựa trên repo `rag-all-in-one`
+- Document Ingestor: ưu tiên parser/extractor tốt hơn cho PDF/DOCX/PPTX và scan/OCR, nhưng giữ fallback nhẹ hiện tại để app vẫn chạy được trên Android/Chaquopy.
+- Chunking Techniques: nâng từ cắt ký tự sang token window hoặc chunk theo cấu trúc; đây là hướng an toàn nhất để giảm rủi ro vượt giới hạn embedding.
+- Retrieval: bổ sung hybrid/rerank/metadata filter nếu cần, nhưng giữ retrieval lõi đơn giản để không tăng phụ thuộc.
+- Observability/Evaluation: thêm log, metric, và test chất lượng ingest/retrieval là rất đáng làm vì không phá luồng chính.
+- UI: cải thiện upload/progress/warning thay vì đổi framework giao diện.
+
+Phần không nên đụng hoặc chỉ nên đụng rất ít
+- `HashEmbedding` và `SQLiteVectorDB.search()` nên giữ làm fallback portable; đổi sang ANN hay vector extension chỉ khi chấp nhận phụ thuộc native và thay đổi lớn.
+- SQLite local, WAL, và `DB_PATH = DATA_DIR / "knowledge.db"` không nên đổi nếu chưa có nhu cầu đồng bộ/multi-device rõ ràng.
+- Luồng upload → ingest → chunk → index → poll progress nên giữ nguyên; chỉ nâng parser/chunking/cache, không rewrite sang kiến trúc khác nếu mục tiêu vẫn là app nhẹ, local.
+- `ANDROID_SAFE_CHAT` và fallback extractive mode không nên bỏ vì đây là lớp an toàn khi thiếu API key hoặc khi network/model không ổn định.
+
+Ưu tiên thực tế cho dự án này
+- Giới hạn cache query expansion và nếu cần thì thêm TTL.
+- Cải thiện chunking và warning cho file scan/image-only.
+- Thêm cleanup/maintenance endpoint cho uploads cũ nếu kho tài liệu tăng nhanh.
+- Chỉ khi dữ liệu lớn lên rõ rệt mới cân nhắc ANN hoặc vector DB server riêng.
+
+Kết luận & file đã tạo
+- Tôi đã đọc `resfes.py` và `vector_db.py` kỹ lưỡng.
+- Không phát hiện lỗi cú pháp; các rủi ro chính là về hiệu năng và giới hạn tài nguyên ở quy mô lớn (cache, vector search, storage).
+
+File tài liệu đã được lưu: [docs/resfes_vector_db_explain.txt](docs/resfes_vector_db_explain.txt)
+
+Nếu bạn muốn, tôi có thể:
+- Viết patch để giới hạn cache và thêm TTL.
+- Thêm endpoint cleanup/maintenance cho `uploads` và `chunk_vectors`.
+- Tạo test suite nhỏ để cover ingest → search → ask flow.
+
