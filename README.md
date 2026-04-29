@@ -262,6 +262,14 @@ The study will compare pre/post test scores between a control group (no AI) and 
 
 ---
 
+## 📦 Vector DB (resfes_vector_db)
+
+- **Tóm tắt:** dự án có một phần `resfes_vector_db` (chi tiết trong tài liệu) dùng `HashEmbedding` + `SQLite` làm vector fallback nhẹ, phù hợp cho chạy tại chỗ (on-device) khi không muốn hoặc không có ANN/server bên ngoài.
+- **Chi tiết:** xem [docs/resfes_vector_db_explain.txt](docs/resfes_vector_db_explain.txt) để biết thiết kế, giới hạn, và gợi ý cải tiến.
+- **Bật/Tắt:** set `RESFES_VECTOR_DB_ENABLED=1` trong file `.env` để bật tính năng vector DB (khởi động lại server sau khi thay đổi).
+- **Lưu ý:** hiện implementation đọc tất cả vector từ SQLite khi tìm kiếm — với dataset lớn bạn nên cân nhắc tích hợp ANN hoặc `sqlite-vector-extension` để tối ưu hiệu năng.
+
+
 ## License
 
 MIT
