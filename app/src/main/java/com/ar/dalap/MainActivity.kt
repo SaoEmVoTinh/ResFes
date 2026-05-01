@@ -29,7 +29,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -68,10 +71,33 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 
 // ── Colour palette ────────────────────────────────────────────────────────────
-private val BgDeep      = Color(0xFF060A16)
-private val BgSurface   = Color(0xFF0B1020)
-private val BgCard      = Color(0xFF0D1428)
-private val BgCardAlt   = Color(0xFF0F172A)
+// Dark palette (default)
+private val BgDeep_Dark      = Color(0xFF060A16)
+private val BgSurface_Dark   = Color(0xFF0B1020)
+private val BgCard_Dark      = Color(0xFF0D1428)
+private val BgCardAlt_Dark   = Color(0xFF0F172A)
+private val TextPrimary_Dark = Color(0xFFF0F6FF)
+private val TextSecond_Dark  = Color(0xFFB8C5D6)
+private val TextMuted_Dark   = Color(0xFF637489)
+private val TextHint_Dark    = Color(0xFF3D4D5E)
+private val Border_Dark      = Color(0x12FFFFFF)
+private val BorderMid_Dark   = Color(0x1EFFFFFF)
+private val BorderBright_Dark = Color(0x2CFFFFFF)
+
+// Light palette
+private val BgDeep_Light      = Color(0xFFF4F7FC)
+private val BgSurface_Light   = Color(0xFFEAEFF8)
+private val BgCard_Light      = Color(0xFFFFFFFF)
+private val BgCardAlt_Light   = Color(0xFFF0F4FA)
+private val TextPrimary_Light = Color(0xFF0D1428)
+private val TextSecond_Light  = Color(0xFF3A4A5E)
+private val TextMuted_Light   = Color(0xFF637489)
+private val TextHint_Light    = Color(0xFFA8B5C8)
+private val Border_Light      = Color(0x18000000)
+private val BorderMid_Light   = Color(0x22000000)
+private val BorderBright_Light = Color(0x30000000)
+
+// Accent colours — same in both modes
 private val Teal        = Color(0xFF38EDD6)
 private val TealDim     = Color(0x1A38EDD6)
 private val TealBorder  = Color(0x4038EDD6)
@@ -86,13 +112,22 @@ private val RedDim      = Color(0x1AFF6B6B)
 private val RedBorder   = Color(0x40FF6B6B)
 private val Purple      = Color(0xFF9B8EFF)
 private val PurpleDim   = Color(0x1A9B8EFF)
-private val TextPrimary = Color(0xFFF0F6FF)
-private val TextSecond  = Color(0xFFB8C5D6)
-private val TextMuted   = Color(0xFF637489)
-private val TextHint    = Color(0xFF3D4D5E)
-private val Border      = Color(0x12FFFFFF)
-private val BorderMid   = Color(0x1EFFFFFF)
-private val BorderBright = Color(0x2CFFFFFF)
+
+// CompositionLocal for dark mode flag — set once at DalapScreen level
+val LocalDarkMode = compositionLocalOf { true }
+
+// Convenience accessors — read inside @Composable only
+private val bgDeep      @Composable get() = if (LocalDarkMode.current) BgDeep_Dark      else BgDeep_Light
+private val bgSurface   @Composable get() = if (LocalDarkMode.current) BgSurface_Dark   else BgSurface_Light
+private val bgCard      @Composable get() = if (LocalDarkMode.current) BgCard_Dark      else BgCard_Light
+private val bgCardAlt   @Composable get() = if (LocalDarkMode.current) BgCardAlt_Dark   else BgCardAlt_Light
+private val TextPrimary @Composable get() = if (LocalDarkMode.current) TextPrimary_Dark else TextPrimary_Light
+private val TextSecond  @Composable get() = if (LocalDarkMode.current) TextSecond_Dark  else TextSecond_Light
+private val TextMuted   @Composable get() = if (LocalDarkMode.current) TextMuted_Dark   else TextMuted_Light
+private val TextHint    @Composable get() = if (LocalDarkMode.current) TextHint_Dark    else TextHint_Light
+private val Border      @Composable get() = if (LocalDarkMode.current) Border_Dark      else Border_Light
+private val BorderMid   @Composable get() = if (LocalDarkMode.current) BorderMid_Dark   else BorderMid_Light
+private val BorderBright @Composable get() = if (LocalDarkMode.current) BorderBright_Dark else BorderBright_Light
 
 // ── Data models ───────────────────────────────────────────────────────────────
 data class KbDocument(
@@ -111,6 +146,14 @@ data class KbDocument(
         return orig ?: file ?: "Tài liệu"
     }
 }
+
+data class KbChunk(
+    val id: Int,
+    val chunkIdx: Int,
+    val text: String,
+    val tokenCount: Int = 0,
+    val charCount: Int = 0,
+)
 
 // ── State ─────────────────────────────────────────────────────────────────────
 object DalapServerState {
@@ -135,6 +178,9 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             DaLAPTheme {
+                val onSyncDocs: (Set<Int>) -> Unit = { ids ->
+                    lifecycleScope.launch { postSelectedDocIds(serverUrl.value, ids) }
+                }
                 DalapScreen(
                     status     = serverStatus.value,
                     url        = serverUrl.value,
@@ -142,6 +188,7 @@ class MainActivity : ComponentActivity() {
                     chunkCount = chunkCount.value,
                     onRefresh  = { refreshState() },
                     onOpenAR   = { openBrowser(serverUrl.value) },
+                    onSyncDocs = onSyncDocs,
                 )
             }
         }
@@ -247,12 +294,15 @@ fun MainApp(
     chunkCount: Int,
     onRefresh: () -> Unit,
     onOpenAR: () -> Unit,
+    onSyncDocs: (Set<Int>) -> Unit,
+    isDarkMode: Boolean,
+    onToggleTheme: () -> Unit,
 ) {
     var selectedTab by remember { mutableStateOf(AppTab.DASHBOARD) }
     var selectedKbDocIds by remember { mutableStateOf<Set<Int>>(emptySet()) }
 
     Scaffold(
-        containerColor = BgDeep,
+        containerColor = bgDeep,
         contentWindowInsets = WindowInsets.statusBars,
         bottomBar = {
             BottomNavBar(
@@ -274,12 +324,17 @@ fun MainApp(
                     chunkCount = chunkCount,
                     onRefresh  = onRefresh,
                     onOpenAR   = onOpenAR,
+                    isDarkMode = isDarkMode,
+                    onToggleTheme = onToggleTheme,
                 )
                 AppTab.KNOWLEDGE_BASE -> KnowledgeBaseScreen(
                     serverUrl      = url,
                     onRefreshStats = onRefresh,
                     selectedDocIds = selectedKbDocIds,
-                    onSelectedDocIdsChange = { selectedKbDocIds = it },
+                    onSelectedDocIdsChange = { newIds ->
+                        selectedKbDocIds = newIds
+                        onSyncDocs(newIds)
+                    },
                 )
             }
         }
@@ -293,7 +348,7 @@ fun BottomNavBar(
     onSelect: (AppTab) -> Unit,
 ) {
     Surface(
-        color = Color(0xFF080D1C),
+        color = if (LocalDarkMode.current) Color(0xFF080D1C) else Color(0xFFFFFFFF),
         tonalElevation = 0.dp,
         shadowElevation = 0.dp,
     ) {
@@ -381,6 +436,7 @@ fun NavItem(label: String, icon: String, selected: Boolean, onClick: () -> Unit)
 }
 
 // ── Dashboard screen ──────────────────────────────────────────────────────────
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen(
     status: String,
@@ -389,26 +445,48 @@ fun DashboardScreen(
     chunkCount: Int,
     onRefresh: () -> Unit,
     onOpenAR: () -> Unit,
+    isDarkMode: Boolean,
+    onToggleTheme: () -> Unit,
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp)
-            .padding(top = 20.dp, bottom = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+    var isRefreshing by remember { mutableStateOf(false) }
+    val pullState = rememberPullToRefreshState()
+    val coroutineScope = rememberCoroutineScope()
+
+    PullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = {
+            isRefreshing = true
+            onRefresh()
+            coroutineScope.launch {
+                delay(1200)
+                isRefreshing = false
+            }
+        },
+        state = pullState,
+        modifier = Modifier.fillMaxSize(),
     ) {
-        AppHeader()
-        Spacer(Modifier.height(4.dp))
-        ServerStatusCard(status = status)
-        UrlCard(url = url)
-        StatsRow(docCount = docCount, chunkCount = chunkCount)
-        EndpointsCard()
-        ActionButtons(onRefresh = onRefresh, onOpenAR = onOpenAR, url = url)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp)
+                .padding(top = 20.dp, bottom = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AppHeader(isDarkMode = isDarkMode, onToggleTheme = onToggleTheme)
+            Spacer(Modifier.height(4.dp))
+            ServerStatusCard(status = status)
+            UrlCard(url = url)
+            StatsRow(docCount = docCount, chunkCount = chunkCount)
+            EndpointsCard()
+            // Refresh button kept as secondary action; pull-to-refresh is primary
+            ActionButtons(onRefresh = onRefresh, onOpenAR = onOpenAR, url = url)
+        }
     }
 }
 
 // ── Knowledge Base screen ─────────────────────────────────────────────────────
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun KnowledgeBaseScreen(
     serverUrl: String,
@@ -427,6 +505,8 @@ fun KnowledgeBaseScreen(
     var uploadMsg   by remember { mutableStateOf("") }
     var processingStage by remember { mutableStateOf("") }
     var processingProgress by remember { mutableStateOf(0) }
+    var processingDocId by remember { mutableStateOf<Int?>(null) }
+    var processingDocName by remember { mutableStateOf("") }
     var showIngestWarning by remember { mutableStateOf(false) }
     var ingestWarningText by remember { mutableStateOf("") }
     var filterSubj  by remember { mutableStateOf("") }
@@ -436,6 +516,14 @@ fun KnowledgeBaseScreen(
     var pendingUploadName by remember { mutableStateOf("") }
     var pendingDisplayName by remember { mutableStateOf("") }
     var pendingFileType by remember { mutableStateOf("txt") }
+    var chunkViewerDoc by remember { mutableStateOf<KbDocument?>(null) }
+    var chunkViewerItems by remember { mutableStateOf<List<KbChunk>>(emptyList()) }
+    var chunkViewerLoading by remember { mutableStateOf(false) }
+    var chunkViewerError by remember { mutableStateOf("") }
+    var chunkViewerStage by remember { mutableStateOf("") }
+    var chunkViewerProgress by remember { mutableStateOf(0) }
+    var chunkViewerChunkCount by remember { mutableStateOf(0) }
+    var chunkViewerVectorCount by remember { mutableStateOf(0) }
 
     val baseUrl = serverUrl.ifBlank { "https://localhost:5000" }
 
@@ -469,6 +557,73 @@ fun KnowledgeBaseScreen(
             } catch (e: Exception) {
                 Log.w("KB", "Health load error: ${e.message}")
             }
+        }
+    }
+
+    fun openChunkViewer(doc: KbDocument) {
+        chunkViewerDoc = doc
+        chunkViewerLoading = true
+        chunkViewerError = ""
+        chunkViewerItems = emptyList()
+        chunkViewerStage = "Đang tải trạng thái chunks..."
+        chunkViewerProgress = 0
+        chunkViewerChunkCount = 0
+        chunkViewerVectorCount = 0
+        coroutineScope.launch {
+            try {
+                val status = fetchDocumentStatus(baseUrl, doc.id)
+                chunkViewerStage = status.stageText
+                chunkViewerProgress = status.progress
+                chunkViewerChunkCount = status.chunkCount
+                chunkViewerVectorCount = status.vectorCount
+                if (status.chunkCount > 0) {
+                    chunkViewerItems = fetchDocumentChunks(baseUrl, doc.id)
+                }
+            } catch (e: Exception) {
+                chunkViewerError = e.message ?: "Không tải được chunks"
+                Log.e("KB", "Chunk load error: ${e.message}")
+            } finally {
+                chunkViewerLoading = false
+            }
+        }
+    }
+
+    fun refreshChunkViewer() {
+        val doc = chunkViewerDoc ?: return
+        openChunkViewer(doc)
+    }
+
+    LaunchedEffect(chunkViewerDoc?.id) {
+        val doc = chunkViewerDoc ?: return@LaunchedEffect
+        while (chunkViewerDoc?.id == doc.id) {
+            try {
+                val status = fetchDocumentStatus(baseUrl, doc.id)
+                chunkViewerStage = status.stageText
+                chunkViewerProgress = status.progress
+                chunkViewerChunkCount = status.chunkCount
+                chunkViewerVectorCount = status.vectorCount
+
+                if (status.chunkCount > 0) {
+                    val chunks = fetchDocumentChunks(baseUrl, doc.id)
+                    chunkViewerItems = chunks
+                    if (chunks.isNotEmpty() && (status.isDone || status.vectorCount >= status.chunkCount)) {
+                        chunkViewerStage = "Chunks đã tải xong"
+                        chunkViewerProgress = 100
+                        break
+                    }
+                }
+
+                if (status.isDone && status.chunkCount <= 0) {
+                    chunkViewerStage = "Chưa có chunks"
+                    break
+                }
+            } catch (e: Exception) {
+                chunkViewerError = e.message ?: "Không tải được chunks"
+                Log.e("KB", "Chunk viewer poll error: ${e.message}")
+                break
+            }
+
+            delay(2000)
         }
     }
 
@@ -506,7 +661,7 @@ fun KnowledgeBaseScreen(
                     pendingFileType = "txt"
                 }
             },
-            containerColor   = BgCard,
+            containerColor   = bgCard,
             shape            = RoundedCornerShape(20.dp),
             titleContentColor = TextPrimary,
             textContentColor  = TextSecond,
@@ -563,11 +718,64 @@ fun KnowledgeBaseScreen(
                             focusedBorderColor      = Teal,
                             unfocusedBorderColor    = BorderMid,
                             cursorColor             = Teal,
-                            focusedContainerColor   = BgDeep,
-                            unfocusedContainerColor = BgDeep,
+                            focusedContainerColor   = bgDeep,
+                            unfocusedContainerColor = bgDeep,
                         ),
                         shape = RoundedCornerShape(12.dp),
                     )
+
+                    if (uploadMsg.isNotBlank() || processingStage.isNotBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(bgCardAlt)
+                                .border(1.dp, BorderMid, RoundedCornerShape(12.dp))
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                uploadMsg.ifBlank { "Đang xử lý tài liệu..." },
+                                fontSize = 12.sp,
+                                color = TextPrimary,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            if (processingDocName.isNotBlank()) {
+                                Text(
+                                    processingDocName,
+                                    fontSize = 11.sp,
+                                    color = TextMuted,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            if (processingStage.isNotBlank()) {
+                                Text(
+                                    if (processingProgress in 1..100) "$processingStage (${processingProgress}%)" else processingStage,
+                                    fontSize = 11.sp,
+                                    color = Teal,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                            }
+                            if (processingStage.isNotBlank()) {
+                                if (processingProgress in 1..99) {
+                                    LinearProgressIndicator(
+                                        progress = processingProgress / 100f,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(6.dp),
+                                    )
+                                } else {
+                                    LinearProgressIndicator(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(6.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {
@@ -615,10 +823,15 @@ fun KnowledgeBaseScreen(
                                 // If server created a doc id, start polling for processing progress
                                 val docId = res.id
                                 if (docId != null && !emptyOrWarningIngest) {
-                                    processingStage = if (res.indexed == true) "Hoàn tất" else "Chờ xử lý"
+                                    processingDocId = docId
+                                    processingDocName = displayName
+                                    processingStage = if (res.status == 202) "Đang tách chunks (file lớn)..." else if (res.indexed == true) "Hoàn tất" else "Chờ xử lý"
                                     // Poll until vectors equal chunk count or timeout (interval=1s, timeout=10min)
                                     pollDocumentStatus(baseUrl, docId, onUpdate = { stage, percent ->
-                                        processingStage = stage
+                                        processingStage = when (stage) {
+                                            "Chunking..." -> "Đang tách chunks (file lớn)..."
+                                            else -> stage
+                                        }
                                         processingProgress = percent
                                     }, pollIntervalMs = 1000L, timeoutMs = 10 * 60 * 1000L)
                                 }
@@ -639,13 +852,15 @@ fun KnowledgeBaseScreen(
                                 uploadMsg = ""
                                 processingStage = ""
                                 processingProgress = 0
+                                processingDocId = null
+                                processingDocName = ""
                             }
                         }
                     },
                     shape  = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor         = Teal,
-                        contentColor           = BgDeep,
+                        contentColor           = bgDeep,
                         disabledContainerColor = TealDim,
                         disabledContentColor   = TextMuted,
                     ),
@@ -678,7 +893,7 @@ fun KnowledgeBaseScreen(
     if (showIngestWarning) {
         AlertDialog(
             onDismissRequest = { showIngestWarning = false; ingestWarningText = "" },
-            containerColor   = BgCard,
+            containerColor   = bgCard,
             shape            = RoundedCornerShape(16.dp),
             title = { Text("Cảnh báo trích xuất", fontWeight = FontWeight.Bold, color = TextPrimary) },
             text = { Text(ingestWarningText, color = TextSecond) },
@@ -694,7 +909,7 @@ fun KnowledgeBaseScreen(
     if (deleteConfirmId != null) {
         AlertDialog(
             onDismissRequest = { deleteConfirmId = null },
-            containerColor   = BgCard,
+            containerColor   = bgCard,
             shape            = RoundedCornerShape(20.dp),
             titleContentColor = TextPrimary,
             textContentColor  = TextSecond,
@@ -736,6 +951,187 @@ fun KnowledgeBaseScreen(
         )
     }
 
+    if (chunkViewerDoc != null) {
+        AlertDialog(
+            onDismissRequest = {
+                chunkViewerDoc = null
+                chunkViewerItems = emptyList()
+                chunkViewerLoading = false
+                chunkViewerError = ""
+            },
+            containerColor = bgCard,
+            shape = RoundedCornerShape(20.dp),
+            title = {
+                Row(verticalAlignment = Alignment.Top, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Chunks của tài liệu", fontWeight = FontWeight.Bold, color = TextPrimary)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            chunkViewerDoc?.displayName ?: "",
+                            color = TextSecond,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+
+                    Spacer(Modifier.width(8.dp))
+
+                    TextButton(
+                        onClick = { refreshChunkViewer() },
+                        enabled = !chunkViewerLoading,
+                        shape = RoundedCornerShape(10.dp),
+                    ) {
+                        Text("Làm mới", color = Teal, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            },
+            text = {
+                when {
+                    chunkViewerLoading -> {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(
+                                color = Teal,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                if (chunkViewerStage.isNotBlank()) chunkViewerStage else "Đang tải chunks...",
+                                color = TextSecond,
+                                fontSize = 12.sp,
+                            )
+                        }
+                    }
+                    chunkViewerError.isNotBlank() -> {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Lỗi tải chunks: $chunkViewerError", color = Red, fontSize = 12.sp)
+                            Text(
+                                "Bấm Làm mới sau vài giây để kiểm tra lại trạng thái load chunks.",
+                                color = TextMuted,
+                                fontSize = 11.sp,
+                            )
+                        }
+                    }
+                    chunkViewerItems.isEmpty() -> {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                if (chunkViewerStage.isNotBlank()) chunkViewerStage else "Tài liệu này chưa có chunk nào.",
+                                color = TextSecond,
+                                fontSize = 12.sp,
+                            )
+                            if (chunkViewerProgress in 1..99) {
+                                LinearProgressIndicator(
+                                    progress = chunkViewerProgress / 100f,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp),
+                                )
+                            } else if (chunkViewerStage.isNotBlank() && !chunkViewerStage.contains("xong", ignoreCase = true)) {
+                                LinearProgressIndicator(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp),
+                                )
+                            }
+                            Text(
+                                "Chunks: $chunkViewerChunkCount · Vector: $chunkViewerVectorCount",
+                                color = TextMuted,
+                                fontSize = 11.sp,
+                            )
+                            Text(
+                                "Nếu file lớn vẫn đang xử lý nền, bấm Làm mới để kiểm tra lại.",
+                                color = TextMuted,
+                                fontSize = 11.sp,
+                            )
+                        }
+                    }
+                    else -> {
+                        Column {
+                            Text(
+                                "Tổng: ${chunkViewerItems.size} chunks",
+                                color = TextMuted,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            if (chunkViewerStage.isNotBlank()) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    if (chunkViewerProgress in 1..100) "$chunkViewerStage (${chunkViewerProgress}%)" else chunkViewerStage,
+                                    color = Teal,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 420.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                items(chunkViewerItems, key = { it.id }) { chunk ->
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(bgCardAlt)
+                                            .border(1.dp, BorderMid, RoundedCornerShape(12.dp))
+                                            .padding(10.dp),
+                                    ) {
+                                        Text(
+                                            "#${chunk.chunkIdx} · ${chunk.tokenCount} tok · ${chunk.charCount} chars",
+                                            fontSize = 10.sp,
+                                            color = Teal,
+                                            fontWeight = FontWeight.Bold,
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        Text(
+                                            chunk.text,
+                                            fontSize = 12.sp,
+                                            color = TextPrimary,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        chunkViewerDoc = null
+                        chunkViewerItems = emptyList()
+                        chunkViewerLoading = false
+                        chunkViewerError = ""
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("Đóng")
+                }
+            },
+        )
+    }
+
+    // ── Pull-to-refresh state ────────────────────────────────────────────────
+    var isPtrRefreshing by remember { mutableStateOf(false) }
+    val kbPullState = rememberPullToRefreshState()
+
+    PullToRefreshBox(
+        isRefreshing = isPtrRefreshing,
+        onRefresh = {
+            isPtrRefreshing = true
+            coroutineScope.launch {
+                loadDocs()
+                loadHealth()
+                delay(800)
+                isPtrRefreshing = false
+            }
+        },
+        state = kbPullState,
+        modifier = Modifier.fillMaxSize(),
+    ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -767,7 +1163,7 @@ fun KnowledgeBaseScreen(
                 shape    = RoundedCornerShape(14.dp),
                 colors   = ButtonDefaults.buttonColors(
                     containerColor         = Teal,
-                    contentColor           = BgDeep,
+                    contentColor           = bgDeep,
                     disabledContainerColor = TealDim,
                     disabledContentColor   = TextMuted,
                 ),
@@ -815,7 +1211,7 @@ fun KnowledgeBaseScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(10.dp))
-                        .background(BgCardAlt)
+                        .background(bgCardAlt)
                         .border(1.dp, BorderMid, RoundedCornerShape(10.dp))
                         .padding(10.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -826,6 +1222,16 @@ fun KnowledgeBaseScreen(
                     if (processingProgress in 1..100) {
                         Text("${processingProgress}%", fontSize = 12.sp, color = TextSecond)
                     }
+                }
+                if (processingDocName.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Tài liệu: $processingDocName",
+                        fontSize = 11.sp,
+                        color = TextMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
                 Spacer(Modifier.height(6.dp))
                 if (processingProgress in 1..99) {
@@ -853,16 +1259,17 @@ fun KnowledgeBaseScreen(
                     focusedBorderColor      = Teal,
                     unfocusedBorderColor    = BorderMid,
                     cursorColor             = Teal,
-                    focusedContainerColor   = BgCard,
-                    unfocusedContainerColor = BgCard,
+                    focusedContainerColor   = bgCard,
+                    unfocusedContainerColor = bgCard,
                 ),
                 shape = RoundedCornerShape(12.dp),
             )
+            // Lọc
             Button(
                 onClick = { loadDocs() },
                 shape   = RoundedCornerShape(12.dp),
                 colors  = ButtonDefaults.buttonColors(
-                    containerColor = BgCard,
+                    containerColor = bgCard,
                     contentColor   = TextSecond,
                 ),
                 border  = BorderStroke(1.dp, BorderMid),
@@ -870,6 +1277,23 @@ fun KnowledgeBaseScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp),
             ) {
                 Text("Lọc", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            // Reload icon button (pull-to-refresh is primary, this is secondary)
+            val reloadInteraction = remember { MutableInteractionSource() }
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(bgCard)
+                    .border(1.dp, BorderMid, RoundedCornerShape(12.dp))
+                    .clickable(
+                        interactionSource = reloadInteraction,
+                        indication = ripple(bounded = true, color = Teal),
+                        onClick = { loadDocs(); loadHealth() },
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("↻", fontSize = 18.sp, color = TextSecond, fontWeight = FontWeight.Bold)
             }
         }
 
@@ -939,7 +1363,7 @@ fun KnowledgeBaseScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(20.dp))
-                        .background(BgCard)
+                        .background(bgCard)
                         .border(1.dp, BorderMid, RoundedCornerShape(20.dp))
                         .padding(vertical = 48.dp),
                     contentAlignment = Alignment.Center,
@@ -975,8 +1399,12 @@ fun KnowledgeBaseScreen(
                     items(documents, key = { it.id }) { doc ->
                         DocumentCard(
                             doc      = doc,
+                            onViewChunks = { openChunkViewer(doc) },
                             onDelete = { deleteConfirmId = doc.id },
                             selected = selectedDocIds.contains(doc.id),
+                            isProcessing = processingDocId == doc.id && processingStage.isNotBlank(),
+                            processingStageLabel = if (processingDocId == doc.id) processingStage else "",
+                            processingPercent = if (processingDocId == doc.id) processingProgress else 0,
                             onToggleSelected = {
                                 onSelectedDocIdsChange(
                                     if (selectedDocIds.contains(doc.id)) selectedDocIds - doc.id else selectedDocIds + doc.id
@@ -987,7 +1415,8 @@ fun KnowledgeBaseScreen(
                 }
             }
         }
-    }
+    } // end Column
+    } // end PullToRefreshBox
 }
 
 @Composable
@@ -1009,7 +1438,16 @@ fun KbStatChip(text: String, color: Color) {
 }
 
 @Composable
-fun DocumentCard(doc: KbDocument, onDelete: () -> Unit, selected: Boolean, onToggleSelected: () -> Unit) {
+fun DocumentCard(
+    doc: KbDocument,
+    onViewChunks: () -> Unit,
+    onDelete: () -> Unit,
+    selected: Boolean,
+    isProcessing: Boolean,
+    processingStageLabel: String,
+    processingPercent: Int,
+    onToggleSelected: () -> Unit,
+) {
     val (fileLabel, iconColor) = when (doc.fileType.lowercase()) {
         "pdf"   -> Pair("PDF",  Teal)
         "txt"   -> Pair("TXT",  Green)
@@ -1023,7 +1461,7 @@ fun DocumentCard(doc: KbDocument, onDelete: () -> Unit, selected: Boolean, onTog
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
-            .background(BgCard)
+            .background(bgCard)
             .border(1.dp, BorderMid, RoundedCornerShape(16.dp))
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -1054,7 +1492,7 @@ fun DocumentCard(doc: KbDocument, onDelete: () -> Unit, selected: Boolean, onTog
             colors = CheckboxDefaults.colors(
                 checkedColor = Teal,
                 uncheckedColor = TextHint,
-                checkmarkColor = BgDeep,
+                checkmarkColor = bgDeep,
             ),
         )
 
@@ -1098,7 +1536,45 @@ fun DocumentCard(doc: KbDocument, onDelete: () -> Unit, selected: Boolean, onTog
                         fontWeight = FontWeight.Medium,
                     )
                 }
+            } else if (isProcessing) {
+                Spacer(Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(5.dp)
+                            .clip(CircleShape)
+                            .background(Amber),
+                    )
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        if (processingPercent in 1..99) "$processingStageLabel (${processingPercent}%)" else processingStageLabel,
+                        fontSize = 10.sp,
+                        color = Amber,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
+        }
+
+        Spacer(Modifier.width(8.dp))
+
+        val chunkInteraction = remember { MutableInteractionSource() }
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(TealDim)
+                .border(1.dp, TealBorder, RoundedCornerShape(10.dp))
+                .clickable(
+                    interactionSource = chunkInteraction,
+                    indication = ripple(bounded = true, color = Teal),
+                    onClick = onViewChunks,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("≡", fontSize = 14.sp, color = Teal, fontWeight = FontWeight.Bold)
         }
 
         Spacer(Modifier.width(8.dp))
@@ -1177,6 +1653,95 @@ private suspend fun fetchDocuments(baseUrl: String, subject: String?): List<KbDo
         }
     }
 
+private data class KbDocumentStatus(
+    val chunkCount: Int,
+    val vectorCount: Int,
+    val stage: String,
+    val message: String,
+    val progress: Int,
+) {
+    val isDone: Boolean get() = stage == "done" || stage == "error"
+    val stageText: String
+        get() = when {
+            message.isNotBlank() -> message
+            stage == "queued" -> "Đã upload, đang chờ xử lý nền..."
+            stage == "extracting" -> "Đang đọc và trích xuất văn bản..."
+            stage == "chunking" -> "Đang tách chunks..."
+            stage == "indexing" -> "Đang vector hóa chunks..."
+            stage == "done" -> "Chunks đã tải xong"
+            stage == "error" -> "Lỗi xử lý tài liệu"
+            else -> "Đang kiểm tra trạng thái..."
+        }
+}
+
+private suspend fun fetchDocumentStatus(baseUrl: String, docId: Int): KbDocumentStatus =
+    withContext(Dispatchers.IO) {
+        val conn = openConnection(
+            "$baseUrl/kb/documents/$docId",
+            apiKey = DalapServerState.apiKey,
+        )
+        try {
+            if (conn.responseCode !in 200..299) {
+                throw IllegalStateException("HTTP ${conn.responseCode}")
+            }
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val json = JSONObject(body)
+            KbDocumentStatus(
+                chunkCount = json.optInt("chunk_count", 0),
+                vectorCount = json.optInt("vector_count", 0),
+                stage = json.optString("ingest_stage", "").trim().lowercase(),
+                message = json.optString("ingest_message", "").trim(),
+                progress = json.optInt("ingest_progress", 0).coerceIn(0, 100),
+            )
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+private suspend fun fetchDocumentChunks(baseUrl: String, docId: Int, pageSize: Int = 100): List<KbChunk> =
+    withContext(Dispatchers.IO) {
+        val out = mutableListOf<KbChunk>()
+        var page = 1
+        var total = Int.MAX_VALUE
+
+        while (out.size < total) {
+            val conn = openConnection(
+                "$baseUrl/kb/documents/$docId/chunks?page=$page&page_size=$pageSize",
+                apiKey = DalapServerState.apiKey,
+            )
+            try {
+                if (conn.responseCode !in 200..299) {
+                    throw IllegalStateException("HTTP ${conn.responseCode}")
+                }
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(body)
+                total = json.optInt("total", out.size)
+                val arr = json.optJSONArray("chunks") ?: JSONArray()
+                if (arr.length() == 0) break
+
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    out.add(
+                        KbChunk(
+                            id = obj.optInt("id", 0),
+                            chunkIdx = obj.optInt("chunk_idx", 0),
+                            text = obj.optString("text", ""),
+                            tokenCount = obj.optInt("token_count", 0),
+                            charCount = obj.optInt("char_count", 0),
+                        )
+                    )
+                }
+
+                if (arr.length() < pageSize) break
+                page += 1
+            } finally {
+                conn.disconnect()
+            }
+        }
+
+        out.sortedBy { it.chunkIdx }
+    }
+
 private suspend fun uploadDocument(
     context: Context,
     baseUrl: String,
@@ -1248,6 +1813,29 @@ private suspend fun deleteDocument(baseUrl: String, docId: Int): Boolean =
         ok
     }
 
+private suspend fun postSelectedDocIds(baseUrl: String, docIds: Set<Int>) {
+    if (baseUrl.isBlank()) return
+    withContext(Dispatchers.IO) {
+        try {
+            val conn = openConnection(
+                "$baseUrl/kb/selected-docs",
+                method = "POST",
+                apiKey = DalapServerState.apiKey,
+                contentType = "application/json"
+            )
+            conn.doOutput = true
+            val body = JSONObject().apply {
+                put("doc_ids", JSONArray(docIds.toList()))
+            }.toString()
+            conn.outputStream.use { it.write(body.toByteArray()) }
+            conn.responseCode
+            conn.disconnect()
+        } catch (e: Exception) {
+            Log.w("DALAP", "postSelectedDocIds failed: ${e.message}")
+        }
+    }
+}
+
 private suspend fun pollDocumentStatus(
     baseUrl: String,
     docId: Int,
@@ -1266,9 +1854,25 @@ private suspend fun pollDocumentStatus(
                     val json = JSONObject(body)
                     val chunkCount = json.optInt("chunk_count", 0)
                     val vectorCount = json.optInt("vector_count", 0)
+                    val ingestStage = json.optString("ingest_stage", "").trim().lowercase()
+                    val ingestMessage = json.optString("ingest_message", "").trim()
+                    val ingestProgress = json.optInt("ingest_progress", 0).coerceIn(0, 100)
+
+                    if (ingestStage == "error") {
+                        onUpdate(if (ingestMessage.isNotBlank()) ingestMessage else "Lỗi xử lý tài liệu", 0)
+                        conn.disconnect()
+                        return@withContext
+                    }
 
                     if (chunkCount <= 0) {
-                        onUpdate("Chunking...", 0)
+                        val stageText = when {
+                            ingestMessage.isNotBlank() -> ingestMessage
+                            ingestStage == "queued" -> "Đã upload, đang chờ xử lý nền..."
+                            ingestStage == "extracting" -> "Đang đọc và trích xuất văn bản..."
+                            ingestStage == "chunking" -> "Đang tách chunks..."
+                            else -> "Đang tách chunks..."
+                        }
+                        onUpdate(stageText, ingestProgress)
                     } else {
                         val percent = (if (chunkCount > 0) (vectorCount * 100 / chunkCount) else 0).coerceIn(0, 100)
                         if (percent >= 100) {
@@ -1344,11 +1948,27 @@ fun DalapScreen(
     chunkCount: Int,
     onRefresh: () -> Unit,
     onOpenAR: () -> Unit,
-) = MainApp(status, url, docCount, chunkCount, onRefresh, onOpenAR)
+    onSyncDocs: (Set<Int>) -> Unit,
+) {
+    var isDarkMode by rememberSaveable { mutableStateOf(true) }
+    CompositionLocalProvider(LocalDarkMode provides isDarkMode) {
+        MainApp(
+            status     = status,
+            url        = url,
+            docCount   = docCount,
+            chunkCount = chunkCount,
+            onRefresh  = onRefresh,
+            onOpenAR   = onOpenAR,
+            onSyncDocs = onSyncDocs,
+            isDarkMode = isDarkMode,
+            onToggleTheme = { isDarkMode = !isDarkMode },
+        )
+    }
+}
 
 // ── App Header ────────────────────────────────────────────────────────────────
 @Composable
-fun AppHeader() {
+fun AppHeader(isDarkMode: Boolean, onToggleTheme: () -> Unit) {
     val infiniteTransition = rememberInfiniteTransition(label = "dot")
     val alpha by infiniteTransition.animateFloat(
         initialValue = 1f, targetValue = 0.25f,
@@ -1361,7 +1981,7 @@ fun AppHeader() {
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(top = 4.dp),
     ) {
-        // Live indicator
+        // Live indicator dot
         Box(
             modifier = Modifier
                 .size(8.dp)
@@ -1386,6 +2006,39 @@ fun AppHeader() {
             )
         }
         Spacer(Modifier.weight(1f))
+
+        // ── Theme toggle pill ─────────────────────────────────────────────
+        val toggleInteraction = remember { MutableInteractionSource() }
+        val trackBg = if (isDarkMode) Color(0xFF1A2540) else Color(0xFFE8EDF6)
+        val trackBorder = if (isDarkMode) TealBorder else Color(0x40000000)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(RoundedCornerShape(20.dp))
+                .background(trackBg)
+                .border(1.dp, trackBorder, RoundedCornerShape(20.dp))
+                .clickable(
+                    interactionSource = toggleInteraction,
+                    indication = ripple(bounded = true, color = Teal),
+                    onClick = onToggleTheme,
+                )
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+        ) {
+            Text(
+                text      = if (isDarkMode) "🌙" else "☀️",
+                fontSize  = 14.sp,
+            )
+            Spacer(Modifier.width(5.dp))
+            Text(
+                text       = if (isDarkMode) "Dark" else "Light",
+                fontSize   = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color      = if (isDarkMode) Teal else Color(0xFF4A6080),
+            )
+        }
+
+        Spacer(Modifier.width(8.dp))
+
         // Version badge
         Box(
             modifier = Modifier
@@ -1577,7 +2230,7 @@ fun StatCard(
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(16.dp))
-            .background(BgCard)
+            .background(bgCard)
             .border(1.dp, accent.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
             .padding(horizontal = 14.dp, vertical = 14.dp)
     ) {
@@ -1699,8 +2352,8 @@ fun ActionButtons(onRefresh: () -> Unit, onOpenAR: () -> Unit, url: String) {
             shape    = RoundedCornerShape(14.dp),
             colors   = ButtonDefaults.buttonColors(
                 containerColor         = Teal,
-                contentColor           = BgDeep,
-                disabledContainerColor = BgCard,
+                contentColor           = bgDeep,
+                disabledContainerColor = bgCard,
                 disabledContentColor   = TextHint,
             ),
             border = if (url.isNotBlank()) null
@@ -1726,7 +2379,7 @@ fun ArCard(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(18.dp))
-            .background(BgCard)
+            .background(bgCard)
             .border(1.dp, borderColor, RoundedCornerShape(18.dp))
             .padding(16.dp),
         content = content,
@@ -1756,6 +2409,7 @@ fun DalapScreenPreview() {
             chunkCount = 214,
             onRefresh  = {},
             onOpenAR   = {},
+            onSyncDocs = {},
         )
     }
 }

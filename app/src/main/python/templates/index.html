@@ -260,6 +260,8 @@ html,body{width:100%;height:100%;overflow:hidden;
   border-radius:10px;padding:12px;display:flex;align-items:center;gap:12px;
   transition:all .15s}
 .kb-doc:hover{background:rgba(255,255,255,.08)}
+.kb-doc.selected{background:rgba(88,231,202,.08);border-color:rgba(88,231,202,.35);box-shadow:0 0 0 1px rgba(88,231,202,.08) inset}
+.kb-doc.selected .kb-doc-name{color:#58e7ca}
 .kb-doc-icon{font-size:24px;flex-shrink:0}
 .kb-doc-info{flex:1;min-width:0}
 .kb-doc-name{font-size:13px;font-weight:600;color:var(--text);
@@ -636,7 +638,16 @@ html,body{width:100%;height:100%;overflow:hidden;
       <button class="ico-btn" id="wake-btn" onclick="toggleWake()" title="Wake word">👂</button>
       <button class="ico-btn" id="tts-btn" onclick="toggleTTS()" title="TTS">🔊</button>
       <button class="ico-btn" id="guide-btn" onclick="toggleGestureGuide()" title="Hướng dẫn cử chỉ">🧭</button>
-      <button class="ico-btn" id="kb-btn" onclick="toggleKB()" title="Knowledge Base">📚</button>
+      <div class="pill" id="kb-btn" onclick="toggleKB()" title="Knowledge Base" style="cursor:pointer;display:inline-flex;align-items:center;gap:0;">
+        📚 KB
+        <span id="kb-selected-count" style="
+          display:none;margin-left:5px;padding:1px 6px;
+          border-radius:999px;font-size:9px;font-weight:800;
+          background:rgba(88,231,202,0.22);color:#58e7ca;
+          border:1px solid rgba(88,231,202,0.4);
+          vertical-align:middle;line-height:1.5;
+        "></span>
+      </div>
     </div>
     <div class="btn-row">
       <button class="btn btn-clear" id="clear-btn" onclick="doClear()">✕ Xoá</button>
@@ -651,12 +662,21 @@ html,body{width:100%;height:100%;overflow:hidden;
     <div class="kb-header">
       <div style="display:flex;align-items:center;gap:12px;">
         <div class="kb-title">📚 Knowledge Base</div>
-        <div id="kb-selected-count" style="font-size:12px;color:var(--text2)">Tất cả</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
-        <button class="pill" style="font-size:12px;padding:6px 8px" onclick="selectAllKB()">Chọn tất cả</button>
-        <button class="pill" style="font-size:12px;padding:6px 8px" onclick="clearSelectedKB()">Bỏ chọn</button>
         <button class="kb-close" onclick="toggleKB()">✕</button>
+        <button onclick="selectAllKB()" style="
+          padding:5px 12px;border-radius:8px;font-size:11px;font-weight:700;
+          background:rgba(88,231,202,0.1);border:1px solid rgba(88,231,202,0.3);
+          color:#58e7ca;cursor:pointer;margin-right:6px;">
+          Chọn tất cả
+        </button>
+        <button onclick="clearSelectedKB()" style="
+          padding:5px 12px;border-radius:8px;font-size:11px;font-weight:700;
+          background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);
+          color:#a7b1cb;cursor:pointer;margin-right:6px;">
+          Bỏ chọn
+        </button>
       </div>
     </div>
     
@@ -666,6 +686,15 @@ html,body{width:100%;height:100%;overflow:hidden;
       <input type="file" id="kb-file" accept=".pdf,.txt,.md,.docx,.xlsx,.pptx,.csv,.json,.html,.htm,.xml,.rtf,.jpg,.jpeg,.png,.webp,.bmp,.gif" onchange="handleKBUpload(event)">
     </div>
     <div id="kb-last-upload" class="kb-last-upload">Chưa có file mới upload.</div>
+
+    <div id="kb-source-hint" style="
+      font-size:11px;color:#5f6a83;margin-bottom:10px;padding:8px 12px;
+      background:rgba(255,255,255,0.03);border-radius:8px;
+      border:1px solid rgba(255,255,255,0.06);
+    ">
+      ✓ Tick chọn file muốn dùng — câu hỏi chỉ tìm trong file đã chọn.<br>
+      Nếu không chọn gì → tìm trong tất cả tài liệu.
+    </div>
     
     <div id="kb-docs" class="kb-docs"></div>
   </div>
@@ -1533,30 +1562,93 @@ let sessionContext = [];
 let selectedKBDocIds = [];
 let latestKBDocs = [];
 
+async function loadSelectedKBDocIds() {
+  try {
+    // Try to load from server first (for cross-device sync)
+    try {
+      const res = await fetch('/kb/selected-docs', {headers: authHeaders()});
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.doc_ids)) {
+          selectedKBDocIds = data.doc_ids.map(Number).filter(Number.isFinite);
+          try { localStorage.setItem('dalap_selected_kb_doc_ids', JSON.stringify(selectedKBDocIds)); } catch (_) {}
+          return;
+        }
+      }
+    } catch (_) {}
+    // Fallback to localStorage
+    const raw = localStorage.getItem('dalap_selected_kb_doc_ids') || '[]';
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      selectedKBDocIds = parsed.map(Number).filter(Number.isFinite);
+    }
+  } catch (_) {
+    selectedKBDocIds = [];
+  }
+}
+
+function saveSelectedKBDocIds() {
+  try {
+    localStorage.setItem('dalap_selected_kb_doc_ids', JSON.stringify(selectedKBDocIds));
+    // Also sync to server for cross-device access
+    fetch('/kb/selected-docs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', ...authHeaders()},
+      body: JSON.stringify({doc_ids: selectedKBDocIds})
+    }).catch(err => console.warn('Failed to sync KB selection to server:', err));
+  } catch (_) {}
+}
+
 function renderKBSelectionState() {
   const el = $('kb-selected-count');
   if (!el) return;
-  el.textContent = selectedKBDocIds.length ? `${selectedKBDocIds.length} đã chọn` : 'Tất cả';
+  if (selectedKBDocIds.length === 0) {
+    el.textContent = '';
+    el.style.display = 'none';
+  } else {
+    el.textContent = selectedKBDocIds.length;
+    el.style.display = 'inline-block';
+  }
+  // Also update hint text inside modal
+  const hint = $('kb-source-hint');
+  if (hint) {
+    hint.style.color = selectedKBDocIds.length ? '#58e7ca' : '#5f6a83';
+    hint.innerHTML = selectedKBDocIds.length
+      ? `✓ Đang dùng ${selectedKBDocIds.length} file đã chọn cho câu hỏi.`
+      : '✓ Tick chọn file muốn dùng — câu hỏi chỉ tìm trong file đã chọn.<br>Nếu không chọn gì → tìm trong tất cả tài liệu.';
+  }
+}
+
+function syncKBDocSelectionVisualState(docId, isSelected) {
+  const row = $('kb-row-' + docId);
+  if (row) row.classList.toggle('selected', !!isSelected);
+  const checkbox = $('kb-ch-' + docId);
+  if (checkbox) checkbox.checked = !!isSelected;
 }
 
 function toggleSelectedDoc(id) {
   id = Number(id);
   const idx = selectedKBDocIds.indexOf(id);
-  if (idx === -1) selectedKBDocIds.push(id); else selectedKBDocIds.splice(idx, 1);
+  const isSelected = idx === -1;
+  if (isSelected) selectedKBDocIds.push(id); else selectedKBDocIds.splice(idx, 1);
+  saveSelectedKBDocIds();
+  syncKBDocSelectionVisualState(id, isSelected);
   renderKBSelectionState();
 }
 
 function selectAllKB() {
   if (!latestKBDocs || !latestKBDocs.length) return;
   selectedKBDocIds = latestKBDocs.map(d => d.id);
+  saveSelectedKBDocIds();
   // mark checkboxes
-  latestKBDocs.forEach(d => { const c = $('kb-ch-' + d.id); if (c) c.checked = true; });
+  latestKBDocs.forEach(d => syncKBDocSelectionVisualState(d.id, true));
   renderKBSelectionState();
 }
 
 function clearSelectedKB() {
   selectedKBDocIds = [];
-  latestKBDocs.forEach(d => { const c = $('kb-ch-' + d.id); if (c) c.checked = false; });
+  saveSelectedKBDocIds();
+  latestKBDocs.forEach(d => syncKBDocSelectionVisualState(d.id, false));
   renderKBSelectionState();
 }
 
@@ -2001,10 +2093,12 @@ async function loadKBDocuments() {
     
     const container = $('kb-docs');
     latestKBDocs = data.documents || [];
+    loadSelectedKBDocIds();
     // remove any selected ids that are no longer present
     if (selectedKBDocIds && selectedKBDocIds.length) {
       const validIds = new Set(latestKBDocs.map(d => d.id));
       selectedKBDocIds = selectedKBDocIds.filter(id => validIds.has(id));
+      saveSelectedKBDocIds();
     }
     if (!data.documents || data.documents.length === 0) {
       container.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text3)">Chưa có tài liệu nào. Upload để bắt đầu!</div>';
@@ -2025,9 +2119,9 @@ async function loadKBDocuments() {
       const date = new Date(doc.upload_date).toLocaleDateString('vi-VN');
       
       return `
-        <div class="kb-doc">
+          <div class="kb-doc ${selectedKBDocIds.indexOf(doc.id) !== -1 ? 'selected' : ''}" id="kb-row-${doc.id}">
           <div style="display:flex;align-items:center;gap:8px;">
-            <input id="kb-ch-${doc.id}" type="checkbox" onchange="toggleSelectedDoc(${doc.id})" style="width:18px;height:18px" />
+              <input id="kb-ch-${doc.id}" type="checkbox" ${selectedKBDocIds.indexOf(doc.id) !== -1 ? 'checked' : ''} onchange="toggleSelectedDoc(${doc.id})" style="width:18px;height:18px" />
             <div class="kb-doc-icon">${icon}</div>
           </div>
           <div class="kb-doc-info">
@@ -2177,6 +2271,8 @@ function checkSecurityContext() {
 // ── Init ───────────────────────────────────────────────────────────────────
 (async () => {
   checkSecurityContext();
+  loadSelectedKBDocIds();
+  renderKBSelectionState();
   await startCamera();
   await initMediaPipe();
 })();

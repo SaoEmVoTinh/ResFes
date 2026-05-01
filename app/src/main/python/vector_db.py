@@ -162,19 +162,27 @@ class SQLiteVectorDB:
                 "model": self.model_name,
             }
 
-    def search(self, query: str, top_k: int = 4, subject: Optional[str] = None, doc_ids: Optional[Sequence[int]] = None) -> List[dict]:
+    def search(self, query: str, top_k: int = 4, subject: Optional[str] = None,
+               doc_ids: Optional[Sequence[int]] = None,
+               file_types: Optional[Sequence[str]] = None,
+               min_chunk_tokens: int = 0,
+               max_chunk_tokens: int = 0) -> List[dict]:
         q = self.embedding.embed(query)
         if not any(q):
             return []
 
         k = max(1, int(top_k))
         doc_id_list = [int(d) for d in (doc_ids or []) if str(d).strip().isdigit()]
+        file_type_list = [str(v).strip().lower() for v in (file_types or []) if str(v).strip()]
+        min_chunk_tokens = max(0, int(min_chunk_tokens or 0))
+        max_chunk_tokens = max(0, int(max_chunk_tokens or 0))
 
         params: Iterable[object]
         sql = (
-            "SELECT v.chunk_id, v.doc_id, v.subject, v.embedding, c.text "
+            "SELECT v.chunk_id, v.doc_id, v.subject, v.embedding, c.text, c.token_count, c.char_count, c.chunk_hash, d.file_type, d.original_name "
             "FROM chunk_vectors v "
             "JOIN chunks c ON c.id = v.chunk_id "
+            "JOIN documents d ON d.id = v.doc_id "
         )
 
         clauses = []
@@ -188,6 +196,16 @@ class SQLiteVectorDB:
             placeholders = ",".join("?" for _ in doc_id_list)
             clauses.append(f"v.doc_id IN ({placeholders})")
             params_list.extend(doc_id_list)
+        if file_type_list:
+            placeholders = ",".join("?" for _ in file_type_list)
+            clauses.append(f"LOWER(d.file_type) IN ({placeholders})")
+            params_list.extend(file_type_list)
+        if min_chunk_tokens > 0:
+            clauses.append("COALESCE(c.token_count, 0) >= ?")
+            params_list.append(min_chunk_tokens)
+        if max_chunk_tokens > 0:
+            clauses.append("COALESCE(c.token_count, 0) <= ?")
+            params_list.append(max_chunk_tokens)
 
         if clauses:
             sql += "WHERE " + " AND ".join(clauses) + " "
@@ -207,6 +225,11 @@ class SQLiteVectorDB:
                         "doc_id": int(row["doc_id"]),
                         "text": row["text"] or "",
                         "subject": row["subject"] or "",
+                        "file_type": row["file_type"] or "",
+                        "original_name": row["original_name"] or "",
+                        "token_count": int(row["token_count"] or 0),
+                        "char_count": int(row["char_count"] or 0),
+                        "chunk_hash": row["chunk_hash"] or "",
                         "score": round(float(score), 4),
                     }
                     if len(top_heap) < k:

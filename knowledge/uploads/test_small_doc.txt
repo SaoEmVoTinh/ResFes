@@ -1,1 +1,0 @@
-Chiến lược số một thường liên quan đến việc xác định và ưu tiên các mục tiêu chính. Trong bối cảnh của hệ thống RAG và truy vấn thông tin, chiến lược số một có thể là xác định rõ ràng câu hỏi hoặc yêu cầu của người dùng để đảm bảo hệ thống trả về thông tin chính xác và phù hợp.

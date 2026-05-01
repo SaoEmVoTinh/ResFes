@@ -20,7 +20,7 @@ Mở điện thoại (cùng WiFi):
 # ==== IMPORTS =================================================================
 # ==============================================================================
 
-import os, re, math, json, base64, binascii, sqlite3, socket, shutil, requests, ipaddress, importlib, time, threading
+import os, re, math, json, base64, binascii, hashlib, sqlite3, socket, shutil, requests, ipaddress, importlib, time, threading
 from collections import OrderedDict
 from io import BytesIO
 from datetime import datetime, timezone
@@ -121,6 +121,14 @@ CHUNK_AUGMENT_MAX_PER_CHUNK = int(os.getenv("RESFES_CHUNK_AUGMENT_MAX_PER_CHUNK"
 GROQ_MODEL     = "meta-llama/llama-4-scout-17b-16e-instruct"
 RAG_AGENTIC_DEFAULT = os.getenv("RESFES_RAG_AGENTIC", "1").strip().lower() not in {"0", "false", "no"}
 RAG_FILTER_TOP_K = int(os.getenv("RESFES_RAG_FILTER_TOP_K", "3"))
+RAG_CACHE_MAX_GROUPS = int(os.getenv("RESFES_RAG_CACHE_MAX_GROUPS", "16"))
+RAG_CACHE_TTL_SEC = int(os.getenv("RESFES_RAG_CACHE_TTL_SEC", "1800"))
+CONTEXTUAL_MAX_FILE_MB = int(os.getenv("RESFES_CONTEXTUAL_MAX_FILE_MB", "5"))
+CONTEXTUAL_MAX_EST_CHUNKS = int(os.getenv("RESFES_CONTEXTUAL_MAX_EST_CHUNKS", "300"))
+EXPAND_CACHE_TTL_SEC = int(os.getenv("RESFES_EXPAND_CACHE_TTL_SEC", "1800"))
+LOW_MEMORY_MODE = os.getenv("RESFES_LOW_MEMORY_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+if not os.getenv("RESFES_LOW_MEMORY_MODE", "").strip():
+    LOW_MEMORY_MODE = _is_android_runtime()
 EXPAND_CACHE_MAX = int(os.getenv("RESFES_EXPAND_CACHE_MAX", "64"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -165,6 +173,10 @@ _analyze_hourly_hits = {}
 _chat_hourly_hits = {}
 _quiz_hourly_hits = {}
 _rate_limit_lock = threading.Lock()
+_ingest_status_lock = threading.Lock()
+_ingest_status_by_doc: Dict[int, Dict[str, Any]] = {}
+
+_session_append_count = 0
 
 _ANALYZE_IMAGE_MAX_CHARS = int(os.getenv("RESFES_ANALYZE_IMAGE_MAX_CHARS", str(max(1, MAX_CONTENT_LENGTH_MB) * 1024 * 1024)))
 
@@ -213,6 +225,26 @@ _init_groq_client()
 def _json_error(message: str, status: int = 400, **extra):
     payload = {"error": message, **extra}
     return jsonify(payload), status
+
+
+def _set_ingest_status(doc_id: Optional[int], stage: str, message: str = "", progress: int = 0) -> None:
+    if not doc_id:
+        return
+    payload = {
+        "stage": (stage or "").strip(),
+        "message": (message or "").strip(),
+        "progress": max(0, min(int(progress or 0), 100)),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _ingest_status_lock:
+        _ingest_status_by_doc[int(doc_id)] = payload
+
+
+def _get_ingest_status(doc_id: Optional[int]) -> Dict[str, Any]:
+    if not doc_id:
+        return {}
+    with _ingest_status_lock:
+        return dict(_ingest_status_by_doc.get(int(doc_id), {}))
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -370,7 +402,10 @@ def init_db():
             doc_id    INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             chunk_idx INTEGER NOT NULL,
             text      TEXT NOT NULL,
-            subject   TEXT DEFAULT ''
+            subject   TEXT DEFAULT '',
+            token_count INTEGER NOT NULL DEFAULT 0,
+            char_count  INTEGER NOT NULL DEFAULT 0,
+            chunk_hash  TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS sessions (
@@ -417,6 +452,7 @@ def _migrate_original_names():
                         "UPDATE documents SET original_name = ? WHERE id = ?",
                         (filename, doc_id)
                     )
+                conn.commit()
                 print(f"[DB] ✅ Migration complete: {len(affected)} docs updated")
         finally:
             conn.close()
@@ -424,7 +460,50 @@ def _migrate_original_names():
         print(f"[DB] Migration warning (safe): {e}")
 
 
+def _migrate_chunk_metadata():
+    """Add chunk metadata columns and backfill useful values for old rows."""
+    try:
+        conn = _open_db_connection()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+            if "token_count" not in cols:
+                conn.execute("ALTER TABLE chunks ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0")
+            if "char_count" not in cols:
+                conn.execute("ALTER TABLE chunks ADD COLUMN char_count INTEGER NOT NULL DEFAULT 0")
+            if "chunk_hash" not in cols:
+                conn.execute("ALTER TABLE chunks ADD COLUMN chunk_hash TEXT NOT NULL DEFAULT ''")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_tokens ON chunks(token_count)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(chunk_hash)")
+
+            affected = conn.execute(
+                "SELECT id, text FROM chunks WHERE token_count = 0 OR char_count = 0 OR chunk_hash = ''"
+            ).fetchall()
+            if affected:
+                print(f"[DB] Migrating {len(affected)} chunks: backfilling metadata...")
+                updates = []
+                for row in affected:
+                    normalized_text = re.sub(r'\s+', ' ', row["text"] or "").strip()
+                    token_count = len(re.findall(r'\b[\w]+\b', normalized_text.lower()))
+                    updates.append((
+                        token_count,
+                        len(normalized_text),
+                        hashlib.sha1(normalized_text.encode("utf-8", errors="ignore")).hexdigest(),
+                        row["id"],
+                    ))
+                conn.executemany(
+                    "UPDATE chunks SET token_count = ?, char_count = ?, chunk_hash = ? WHERE id = ?",
+                    updates,
+                )
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB] Chunk metadata migration warning (safe): {e}")
+
+
 _migrate_original_names()
+_migrate_chunk_metadata()
 vector_db = None
 if VECTOR_DB_ENABLED:
     try:
@@ -450,7 +529,10 @@ if VECTOR_DB_ENABLED:
 def split_chunks(text: str, size: int = CHUNK_SIZE,
                  overlap: int = CHUNK_OVERLAP) -> list:
     """Chia văn bản thành chunks theo cửa sổ token, có overlap."""
-    text = re.sub(r'\s+', ' ', text).strip()
+    # Preserve paragraph breaks as sentence boundaries before collapsing whitespace
+    text = re.sub(r'\n{2,}', ' . ', text)   # double newline → sentence break
+    text = re.sub(r'\n', ' ', text)           # single newline → space
+    text = re.sub(r'[ \t]{2,}', ' ', text).strip()  # collapse spaces only
     if not text:
         return []
 
@@ -459,13 +541,8 @@ def split_chunks(text: str, size: int = CHUNK_SIZE,
     step = max(1, size - overlap)
 
     chunks = []
-    sentences = re.split(r'(?<=[.!?])\s+|\n+', text)
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-ZÀÁẠẢÃÂẦẤẤẬẨẪĂẰẮẶẲẴĐÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸ])', text)
     current_tokens: list[str] = []
-    
-    # NEW: Hybrid token-window (Nếu text cực ngắn thì skip split theo chunk size)
-    total_tokens = text.split()
-    if len(total_tokens) <= size:
-        return [text]
 
     def flush_current() -> None:
         nonlocal current_tokens
@@ -515,6 +592,76 @@ def split_chunks(text: str, size: int = CHUNK_SIZE,
 
     flush_current()
     return chunks
+
+
+def _build_chunk_records(text: str, file_type: str = "", original_name: str = "",
+                         subject: str = "", size: int = CHUNK_SIZE,
+                         overlap: int = CHUNK_OVERLAP, skip_contextual: bool = False) -> list[dict]:
+    records = []
+    for chunk_idx, chunk_text in enumerate(split_chunks(text, size=size, overlap=overlap)):
+        normalized_text = re.sub(r'\s+', ' ', chunk_text).strip()
+        if original_name and not skip_contextual:
+            normalized_text = _generate_chunk_context(normalized_text, original_name, subject)
+        if not normalized_text:
+            continue
+        token_count = len(_tokenize(normalized_text))
+        char_count = len(normalized_text)
+        chunk_hash = hashlib.sha1(normalized_text.encode("utf-8", errors="ignore")).hexdigest()
+        records.append({
+            "chunk_idx": chunk_idx,
+            "text": normalized_text,
+            "subject": (subject or "").strip(),
+            "file_type": (file_type or "").strip().lower(),
+            "original_name": original_name or "",
+            "token_count": token_count,
+            "char_count": char_count,
+            "chunk_hash": chunk_hash,
+        })
+    return records
+
+
+# ── Contextual Retrieval ──────────────────────────────────────────────────────
+
+ENABLE_CONTEXTUAL_RETRIEVAL = os.getenv("RESFES_CONTEXTUAL_RETRIEVAL", "1") == "1"
+_contextual_groq_client = None
+
+
+def _get_contextual_groq_client():
+    global _contextual_groq_client
+    if _contextual_groq_client is not None:
+        return _contextual_groq_client
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is empty")
+
+    _contextual_groq_client = Groq(api_key=api_key)
+    return _contextual_groq_client
+
+def _generate_chunk_context(chunk_text: str, doc_name: str, subject: str) -> str:
+    """Prepend a Groq-generated context sentence to improve retrieval accuracy."""
+    if not ENABLE_CONTEXTUAL_RETRIEVAL:
+        return chunk_text
+    try:
+        time.sleep(0.15)   # ~6 calls/sec, stay under free tier limit
+        prompt = (
+            f"Tài liệu: '{doc_name}' (môn: {subject or 'chung'})\n"
+            f"Đoạn trích: {chunk_text[:400]}\n\n"
+            f"Viết 1 câu ngắn (tối đa 20 từ) mô tả đoạn này thuộc phần nào "
+            f"của tài liệu. Chỉ trả về câu đó, không giải thích thêm."
+        )
+        resp = _get_contextual_groq_client().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=60,
+            temperature=0.1,
+        )
+        ctx = resp.choices[0].message.content.strip()
+        if ctx:
+            return f"[{ctx}] {chunk_text}"
+    except Exception as e:
+        print(f"[Contextual] Skipped chunk context: {e}")
+    return chunk_text
 
 
 # ── Tokenizer ─────────────────────────────────────────────────────────────────
@@ -621,6 +768,7 @@ def _rrf_fuse(ranked_lists: list[list], top_k: int) -> list:
 
 _vec_cache: dict = {}
 _cache_dirty     = True
+_vec_cache_built_at = 0.0
 
 
 def _invalidate_cache():
@@ -628,97 +776,164 @@ def _invalidate_cache():
     _cache_dirty = True
 
 
+def _cache_is_stale() -> bool:
+    if _cache_dirty:
+        return True
+    if RAG_CACHE_TTL_SEC <= 0:
+        return False
+    return (time.time() - _vec_cache_built_at) > RAG_CACHE_TTL_SEC
+
+
+def _prune_expand_cache(now: Optional[float] = None) -> None:
+    if not _EXPAND_CACHE:
+        return
+    current = now if now is not None else time.time()
+    ttl = max(1, EXPAND_CACHE_TTL_SEC)
+    expired = [key for key, value in _EXPAND_CACHE.items() if current - value[0] > ttl]
+    for key in expired:
+        _EXPAND_CACHE.pop(key, None)
+
+
 def _ensure_cache():
-    global _vec_cache, _cache_dirty
-    if not _cache_dirty:
+    global _vec_cache, _cache_dirty, _vec_cache_built_at
+    if not _cache_is_stale():
         return
     print("[RAG] Rebuilding hybrid cache (TF-IDF + BM25)...")
 
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, doc_id, text, subject FROM chunks"
+            """SELECT c.id, c.doc_id, c.text, c.subject, c.token_count, c.char_count, c.chunk_hash,
+                      d.file_type, d.original_name
+               FROM chunks c
+               JOIN documents d ON d.id = c.doc_id"""
         ).fetchall()
 
     by_group: dict = {"__all__": []}
     for row in rows:
         if _is_extraction_placeholder(row["text"], ""):
             continue
+        text_value = row["text"] or ""
+        token_count = int(row["token_count"] or len(_tokenize(text_value)))
+        char_count = int(row["char_count"] or len(text_value))
+        chunk_hash = row["chunk_hash"] or hashlib.sha1(
+            re.sub(r'\s+', ' ', text_value).strip().encode("utf-8", errors="ignore")
+        ).hexdigest()
         chunk = {"id": row["id"], "doc_id": row["doc_id"],
-                 "text": row["text"], "subject": row["subject"]}
+                 "text": text_value, "subject": row["subject"],
+                 "file_type": (row["file_type"] or "").strip().lower(),
+                 "original_name": row["original_name"] or "",
+                 "token_count": token_count,
+                 "char_count": char_count,
+                 "chunk_hash": chunk_hash}
         by_group["__all__"].append(chunk)
         s = (row["subject"] or "").lower().strip()
         if s:
             by_group.setdefault(s, []).append(chunk)
 
     new_cache: dict = {}
+    group_sizes: dict[str, int] = {}
     for key, chunk_list in by_group.items():
-        texts      = [c["text"] for c in chunk_list]
+        augmented_chunks = list(chunk_list)
+        if not LOW_MEMORY_MODE:
+            token_docs_preview = [_tokenize(c["text"]) for c in chunk_list]
+            for idx, c in enumerate(chunk_list):
+                tok = token_docs_preview[idx]
+                if len(tok) > int(CHUNK_SIZE * CHUNK_AUGMENT_THRESHOLD):
+                    step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+                    words = c["text"].split()
+                    added = 0
+                    for i in range(0, max(1, len(words) - CHUNK_SIZE + 1), step):
+                        if added >= CHUNK_AUGMENT_MAX_PER_CHUNK:
+                            break
+                        part = words[i:i + CHUNK_SIZE]
+                        subtext = " ".join(part).strip()
+                        if subtext and len(subtext) > 20:
+                            synth = {
+                                "id": int(c["id"]) * 1000 + 1 + added,
+                                "doc_id": c["doc_id"],
+                                "text": subtext,
+                                "subject": c.get("subject", ""),
+                            }
+                            augmented_chunks.append(synth)
+                            added += 1
+
+        texts = [c["text"] for c in augmented_chunks]
         token_docs = [_tokenize(t) for t in texts]
-
-        # TF-IDF
         tf_docs, idf = _build_tfidf(texts)
-
-        # BM25 — tính avgdl và IDF dùng chung với TF-IDF
         avgdl = (sum(len(td) for td in token_docs) / len(token_docs)) if token_docs else 1.0
 
-        # Augment large chunks with sliding-window subchunks (in-memory only)
-        augmented_chunks = []
-        for idx, c in enumerate(chunk_list):
-            augmented_chunks.append(c)
-            # token_docs aligned with texts index
-            tok = token_docs[idx]
-            if len(tok) > int(CHUNK_SIZE * CHUNK_AUGMENT_THRESHOLD):
-                # create sliding windows from the long chunk
-                step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
-                words = c["text"].split()
-                added = 0
-                for i in range(0, max(1, len(words) - CHUNK_SIZE + 1), step):
-                    if added >= CHUNK_AUGMENT_MAX_PER_CHUNK:
-                        break
-                    part = words[i:i + CHUNK_SIZE]
-                    subtext = " ".join(part).strip()
-                    if subtext and len(subtext) > 20:
-                        # create synthetic id to avoid colliding with DB ids
-                        synth = {
-                            "id": int(c["id"]) * 1000 + 1 + added,
-                            "doc_id": c["doc_id"],
-                            "text": subtext,
-                            "subject": c.get("subject", ""),
-                        }
-                        augmented_chunks.append(synth)
-                        added += 1
-
         new_cache[key] = {
-            "chunks":     augmented_chunks,
-            "tf_docs":    _build_tfidf([c["text"] for c in augmented_chunks])[0],
-            "idf":        _build_tfidf([c["text"] for c in augmented_chunks])[1],
-            "token_docs": [_tokenize(c["text"]) for c in augmented_chunks],   # dùng cho BM25
-            "avgdl":      (sum(len(td) for td in [_tokenize(c["text"]) for c in augmented_chunks]) / len(augmented_chunks)) if augmented_chunks else 1.0,
+            "chunks": augmented_chunks,
+            "tf_docs": tf_docs,
+            "idf": idf,
+            "token_docs": token_docs,
+            "avgdl": avgdl,
         }
+        group_sizes[key] = len(augmented_chunks)
+
+    if LOW_MEMORY_MODE or (RAG_CACHE_MAX_GROUPS > 0 and len(new_cache) > RAG_CACHE_MAX_GROUPS):
+        keep_keys = ["__all__"]
+        subject_keys = [k for k in new_cache.keys() if k != "__all__"]
+        subject_keys.sort(key=lambda k: group_sizes.get(k, 0), reverse=True)
+        keep_keys.extend(subject_keys[: max(0, RAG_CACHE_MAX_GROUPS - 1)])
+        new_cache = {k: new_cache[k] for k in keep_keys if k in new_cache}
 
     _vec_cache   = new_cache
     _cache_dirty = False
+    _vec_cache_built_at = time.time()
     total = len(by_group.get("__all__", []))
     print(f"[RAG] Cache ready — {total} chunks, {len(new_cache)} groups")
+
+
+def _normalize_file_types(file_types: Optional[List[str]]) -> set[str]:
+    normalized = set()
+    for file_type in file_types or []:
+        value = str(file_type or "").strip().lower()
+        if value:
+            normalized.add(value)
+    return normalized
+
+
+def _chunk_matches_filters(chunk: dict, file_types: Optional[set[str]] = None,
+                           min_chunk_tokens: int = 0,
+                           max_chunk_tokens: int = 0) -> bool:
+    if file_types:
+        chunk_file_type = (chunk.get("file_type") or "").strip().lower()
+        if chunk_file_type not in file_types:
+            return False
+
+    token_count = int(chunk.get("token_count") or len(_tokenize(chunk.get("text", ""))))
+    if min_chunk_tokens > 0 and token_count < min_chunk_tokens:
+        return False
+    if max_chunk_tokens > 0 and token_count > max_chunk_tokens:
+        return False
+    return True
 
 
 # ── Query expansion (paraphrase bằng Groq) ────────────────────────────────────
 # Sinh thêm 2 biến thể query → tăng recall khi học sinh hỏi theo cách khác.
 # Chỉ gọi khi query đủ ngắn (< 120 ký tự) để tiết kiệm token.
 
-_EXPAND_CACHE: OrderedDict[str, list[str]] = OrderedDict()   # query → [variant1, variant2]
+_EXPAND_CACHE: OrderedDict[str, tuple[float, list[str]]] = OrderedDict()   # query → (ts, [variant1, variant2])
 
 
 def _expand_cache_get(query: str) -> Optional[list[str]]:
-    result = _EXPAND_CACHE.get(query)
-    if result is not None:
-        _EXPAND_CACHE.move_to_end(query)
+    _prune_expand_cache()
+    cached = _EXPAND_CACHE.get(query)
+    if cached is None:
+        return None
+    cached_at, result = cached
+    if EXPAND_CACHE_TTL_SEC > 0 and (time.time() - cached_at) > EXPAND_CACHE_TTL_SEC:
+        _EXPAND_CACHE.pop(query, None)
+        return None
+    _EXPAND_CACHE.move_to_end(query)
     return result
 
 
 def _expand_cache_set(query: str, result: list[str]) -> None:
-    _EXPAND_CACHE[query] = result
+    _EXPAND_CACHE[query] = (time.time(), result)
     _EXPAND_CACHE.move_to_end(query)
+    _prune_expand_cache()
     while len(_EXPAND_CACHE) > max(1, EXPAND_CACHE_MAX):
         _EXPAND_CACHE.popitem(last=False)
 
@@ -760,6 +975,9 @@ def _expand_query(query: str) -> list[str]:
 
 def semantic_search(query: str, subject: Optional[str] = None,
                     doc_ids: Optional[List[int]] = None,
+                    file_types: Optional[List[str]] = None,
+                    min_chunk_tokens: int = 0,
+                    max_chunk_tokens: int = 0,
                     top_k: int = TOP_K,
                     expand: bool = False) -> list:
     """
@@ -768,24 +986,9 @@ def semantic_search(query: str, subject: Optional[str] = None,
     Kết quả trả về đã dedup, sorted by RRF score, kèm cả tfidf_score và bm25_score.
     """
     doc_id_set = {int(d) for d in (doc_ids or []) if str(d).strip().isdigit()}
-
-    # Ưu tiên VectorDB nếu có
-    if vector_db is not None:
-        try:
-            v_results = vector_db.search(
-                query=query,
-                top_k=top_k,
-                subject=subject,
-                doc_ids=sorted(doc_id_set) if doc_id_set else None,
-            )
-            if v_results:
-                v_results = [r for r in v_results if not _is_extraction_placeholder(r.get("text", ""), "")]
-            if v_results:
-                top = v_results[0]["score"] if v_results else 0
-                print(f"[RAG:VectorDB] '{query[:50]}' → {len(v_results)} (top={top:.3f})")
-                return v_results
-        except Exception as e:
-            print(f"[RAG:VectorDB] fallback hybrid due to: {e}")
+    file_type_set = _normalize_file_types(file_types)
+    min_chunk_tokens = max(0, int(min_chunk_tokens or 0))
+    max_chunk_tokens = max(0, int(max_chunk_tokens or 0))
 
     _ensure_cache()
 
@@ -801,14 +1004,58 @@ def semantic_search(query: str, subject: Optional[str] = None,
     chunks     = cache["chunks"]
     tf_docs    = cache["tf_docs"]
     token_docs = cache["token_docs"]
+    vector_ranked: list[list] = []
+    vector_scores: dict[int, float] = {}
 
-    if doc_id_set:
-        filtered = [(chunk, idx) for idx, chunk in enumerate(chunks) if chunk.get("doc_id") in doc_id_set]
-        if not filtered:
+    if doc_id_set or file_type_set or min_chunk_tokens > 0 or max_chunk_tokens > 0:
+        filtered_chunks = []
+        filtered_tf_docs = []
+        filtered_token_docs = []
+        for idx, chunk in enumerate(chunks):
+            if doc_id_set and chunk.get("doc_id") not in doc_id_set:
+                continue
+            if not _chunk_matches_filters(chunk, file_type_set or None, min_chunk_tokens, max_chunk_tokens):
+                continue
+            filtered_chunks.append(chunk)
+            filtered_tf_docs.append(tf_docs[idx])
+            filtered_token_docs.append(token_docs[idx])
+        if not filtered_chunks:
             return []
-        chunks = [chunk for chunk, _ in filtered]
-        tf_docs = [tf_docs[idx] for _, idx in filtered]
-        token_docs = [token_docs[idx] for _, idx in filtered]
+        chunks = filtered_chunks
+        tf_docs = filtered_tf_docs
+        token_docs = filtered_token_docs
+
+    if vector_db is not None:
+        try:
+            v_results = vector_db.search(
+                query=query,
+                top_k=max(top_k * 2, top_k),
+                subject=subject,
+                doc_ids=sorted(doc_id_set) if doc_id_set else None,
+                file_types=sorted(file_type_set) if file_type_set else None,
+                min_chunk_tokens=min_chunk_tokens,
+                max_chunk_tokens=max_chunk_tokens,
+            )
+            v_results = [r for r in v_results if not _is_extraction_placeholder(r.get("text", ""), "")]
+            if v_results:
+                chunk_by_id = {c["id"]: c for c in chunks}
+                for r in v_results:
+                    cid = int(r.get("chunk_id", 0))
+                    vector_scores[cid] = float(r.get("score", 0.0) or 0.0)
+                vector_ranked.append([
+                    (int(r["chunk_id"]), chunk_by_id.get(int(r["chunk_id"]), {
+                        "id": int(r["chunk_id"]),
+                        "doc_id": int(r.get("doc_id", 0)),
+                        "text": r.get("text", "") or "",
+                        "subject": r.get("subject", "") or "",
+                    }))
+                    for r in v_results
+                    if int(r.get("chunk_id", 0)) in chunk_by_id
+                ])
+                top = v_results[0]["score"] if v_results else 0
+                print(f"[RAG:VectorDB] '{query[:50]}' → {len(v_results)} (top={top:.3f})")
+        except Exception as e:
+            print(f"[RAG:VectorDB] fallback hybrid due to: {e}")
 
     # Lấy danh sách queries (với hoặc không expansion)
     queries = _expand_query(query) if expand else [query]
@@ -845,6 +1092,9 @@ def semantic_search(query: str, subject: Optional[str] = None,
         all_ranked.append([(cid, chunk_by_id[cid]) for _, cid in tfidf_scored if cid in chunk_by_id])
         all_ranked.append([(cid, chunk_by_id[cid]) for _, cid in bm25_scored  if cid in chunk_by_id])
 
+    if vector_ranked:
+        all_ranked.extend(vector_ranked)
+
     # RRF fusion
     chunk_by_id = {c["id"]: c for c in chunks}
     fused_ids   = _rrf_fuse(all_ranked, top_k=top_k * 2)   # lấy rộng để rerank
@@ -864,20 +1114,41 @@ def semantic_search(query: str, subject: Optional[str] = None,
         idx   = chunk_idx.get(cid, 0)
         ts    = _cosine(vec_q0, _tfidf_vec(tf_docs[idx], idf))
         bs    = _bm25_score(q0_tokens, token_docs[idx], idf, avgdl)
+        vs    = vector_scores.get(cid, 0.0)
+        parts = [ts, min(bs / 10, 1.0)]
+        if vs > 0:
+            parts.append(vs)
         results.append({
             "chunk_id":    cid,
             "doc_id":      chunk["doc_id"],
             "text":        chunk["text"],
             "subject":     chunk["subject"],
-            "score":       round((ts + min(bs / 10, 1.0)) / 2, 4),
+            "file_type":   chunk.get("file_type", ""),
+            "original_name": chunk.get("original_name", ""),
+            "token_count": int(chunk.get("token_count", len(_tokenize(chunk.get("text", "")))) or 0),
+            "char_count":  int(chunk.get("char_count", len(chunk.get("text", ""))) or 0),
+            "chunk_hash":  chunk.get("chunk_hash", ""),
+            "score":       round(sum(parts) / len(parts), 4),
             "tfidf_score": round(ts, 4),
             "bm25_score":  round(bs, 4),
+            "vector_score": round(vs, 4),
         })
 
+    deduped = []
+    seen_hashes: set[str] = set()
+    for item in results:
+        chunk_hash = item.get("chunk_hash") or hashlib.sha1(
+            re.sub(r'\s+', ' ', item.get("text", "")).strip().encode("utf-8", errors="ignore")
+        ).hexdigest()
+        if chunk_hash in seen_hashes:
+            continue
+        seen_hashes.add(chunk_hash)
+        deduped.append(item)
+
     mode = f"hybrid+expand({len(queries)}q)" if expand else "hybrid"
-    top  = results[0]["score"] if results else 0
-    print(f"[RAG:{mode}] '{query[:50]}' → {len(results)} chunks (top={top:.3f})")
-    return results
+    top  = deduped[0]["score"] if deduped else 0
+    print(f"[RAG:{mode}] '{query[:50]}' → {len(deduped)} chunks (top={top:.3f})")
+    return deduped
 
 
 # ── Document ingestion ────────────────────────────────────────────────────────
@@ -1201,10 +1472,10 @@ def ingest_document(file_bytes: bytes, original_name: str,
     extraction_warning = ""
     if _is_extraction_placeholder(text, normalized_type):
         extraction_warning = text
-        chunks = []
+        chunk_records = []
     else:
-        chunks = split_chunks(text)
-    print(f"[INGEST] {original_name}: {len(text)} chars → {len(chunks)} chunks")
+        chunk_records = _build_chunk_records(text, file_type=normalized_type, original_name=original_name, subject=subject, skip_contextual=True)
+    print(f"[INGEST] {original_name}: {len(text)} chars → {len(chunk_records)} chunks")
 
     chunk_rows = []
     with get_db() as conn:
@@ -1217,11 +1488,19 @@ def ingest_document(file_bytes: bytes, original_name: str,
         )
         doc_id = cur.lastrowid
         conn.executemany(
-            "INSERT INTO chunks (doc_id, chunk_idx, text, subject) VALUES (?,?,?,?)",
-            [(doc_id, i, c, subject) for i, c in enumerate(chunks)]
+            "INSERT INTO chunks (doc_id, chunk_idx, text, subject, token_count, char_count, chunk_hash) VALUES (?,?,?,?,?,?,?)",
+            [(
+                doc_id,
+                item["chunk_idx"],
+                item["text"],
+                item["subject"],
+                item["token_count"],
+                item["char_count"],
+                item["chunk_hash"],
+            ) for item in chunk_records]
         )
 
-        if vector_db is not None:
+        if vector_db is not None and chunk_records:
             chunk_rows = conn.execute(
                 "SELECT id, text FROM chunks WHERE doc_id=? ORDER BY chunk_idx ASC",
                 (doc_id,),
@@ -1241,10 +1520,10 @@ def ingest_document(file_bytes: bytes, original_name: str,
     _invalidate_cache()
     warning = _build_ingest_warning(text, normalized_type, original_name, extraction_warning)
     return {"id": doc_id, "filename": filename,
-            "chunks": len(chunks), "file_size": len(file_bytes),
+            "chunks": len(chunk_records), "file_size": len(file_bytes),
             "vector_chunks": vector_count,
             "original_name": original_name,
-            "indexed": bool(chunks),
+            "indexed": bool(chunk_records),
             "warning": warning}
 
 
@@ -1299,7 +1578,9 @@ def _safe_json_from_llm(raw_text: str) -> dict:
         return {}
     if "```" in text:
         for part in text.split("```"):
-            cand = part.strip().lstrip("json").strip()
+            cand = part.strip()
+            if cand.startswith("json"):
+                cand = cand[4:].strip()
             if cand.startswith("{") and cand.endswith("}"):
                 text = cand
                 break
@@ -1781,6 +2062,7 @@ def ingest_document_from_path(file_path: Path, original_name: str = None, file_t
         original_name = file_path.name
 
     try:
+        _set_ingest_status(doc_id, "extracting", "Đang đọc và trích xuất văn bản...", 5)
         with file_path.open('rb') as f:
             file_bytes = f.read()
 
@@ -1790,10 +2072,27 @@ def ingest_document_from_path(file_path: Path, original_name: str = None, file_t
         extraction_warning = ""
         if _is_extraction_placeholder(text, normalized_type):
             extraction_warning = text
-            chunks = []
+            chunk_records = []
         else:
-            chunks = split_chunks(text)
-        print(f"[INGEST_FROM_PATH] {original_name}: {len(text)} chars → {len(chunks)} chunks")
+            word_count = len((text or "").split())
+            step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+            est_chunks = max(1, int(math.ceil(word_count / step))) if word_count > 0 else 1
+            size_mb = len(file_bytes) / (1024 * 1024)
+            skip_contextual = (size_mb >= CONTEXTUAL_MAX_FILE_MB) or (est_chunks >= CONTEXTUAL_MAX_EST_CHUNKS)
+            if skip_contextual:
+                print(
+                    f"[Contextual] auto-skip for {original_name}: "
+                    f"size={size_mb:.1f}MB, est_chunks={est_chunks}"
+                )
+            _set_ingest_status(doc_id, "chunking", f"Đang tách chunks... (ước tính {est_chunks})", 15)
+            chunk_records = _build_chunk_records(
+                text,
+                file_type=normalized_type,
+                original_name=original_name,
+                subject=subject,
+                skip_contextual=skip_contextual,
+            )
+        print(f"[INGEST_FROM_PATH] {original_name}: {len(text)} chars → {len(chunk_records)} chunks")
 
         with get_db() as conn:
             if doc_id is None:
@@ -1806,11 +2105,19 @@ def ingest_document_from_path(file_path: Path, original_name: str = None, file_t
             else:
                 print(f"[INGEST_FROM_PATH] updating existing doc_id={doc_id} for {file_path.name}")
 
-            if chunks:
+            if chunk_records:
                 conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
                 conn.executemany(
-                    "INSERT INTO chunks (doc_id, chunk_idx, text, subject) VALUES (?,?,?,?)",
-                    [(doc_id, i, c, subject) for i, c in enumerate(chunks)]
+                    "INSERT INTO chunks (doc_id, chunk_idx, text, subject, token_count, char_count, chunk_hash) VALUES (?,?,?,?,?,?,?)",
+                    [(
+                        doc_id,
+                        item["chunk_idx"],
+                        item["text"],
+                        item["subject"],
+                        item["token_count"],
+                        item["char_count"],
+                        item["chunk_hash"],
+                    ) for item in chunk_records]
                 )
             try:
                 conn.commit()
@@ -1819,8 +2126,9 @@ def ingest_document_from_path(file_path: Path, original_name: str = None, file_t
                 pass
 
         vector_count = 0
-        if vector_db is not None and chunks:
+        if vector_db is not None and chunk_records:
             try:
+                _set_ingest_status(doc_id, "indexing", f"Đang vector hóa {len(chunk_records)} chunks...", 70)
                 chunk_rows = []
                 with get_db() as conn:
                     chunk_rows = conn.execute("SELECT id, text FROM chunks WHERE doc_id=? ORDER BY chunk_idx ASC", (doc_id,)).fetchall()
@@ -1830,39 +2138,21 @@ def ingest_document_from_path(file_path: Path, original_name: str = None, file_t
 
         _invalidate_cache()
         warning = _build_ingest_warning(text, normalized_type, original_name, extraction_warning)
+        _set_ingest_status(doc_id, "done", f"Hoàn tất: {len(chunk_records)} chunks", 100)
 
         return {
             "id": doc_id,
             "filename": file_path.name,
             "original_name": original_name,
             "file_type": normalized_type,
-            "chunks": len(chunks),
+            "chunks": len(chunk_records),
             "vectors": vector_count,
             "warning": warning,
         }
     except Exception as e:
+        _set_ingest_status(doc_id, "error", f"Lỗi xử lý: {e}", 0)
         print(f"[INGEST_FROM_PATH] Error processing {file_path}: {e}")
         raise
-
-
-def _analyze_rate_limited() -> float:
-    """Return retry-after seconds if limited, otherwise 0."""
-    if ANALYZE_MIN_INTERVAL_SEC <= 0:
-        return 0.0
-    ip = _get_client_ip()
-    now = time.monotonic()
-    with _rate_limit_lock:
-        last = _analyze_last_hit.get(ip)
-        if last is None:
-            _analyze_last_hit[ip] = now
-            return 0.0
-
-        elapsed = now - last
-        if elapsed < ANALYZE_MIN_INTERVAL_SEC:
-            return ANALYZE_MIN_INTERVAL_SEC - elapsed
-
-        _analyze_last_hit[ip] = now
-        return 0.0
 
 
 def _endpoint_rate_limited(bucket: dict, min_interval_sec: float, key: str) -> float:
@@ -1883,6 +2173,11 @@ def _endpoint_rate_limited(bucket: dict, min_interval_sec: float, key: str) -> f
 
         bucket[key] = now
         return 0.0
+
+
+def _analyze_rate_limited() -> float:
+    ip = _get_client_ip()
+    return _endpoint_rate_limited(_analyze_last_hit, ANALYZE_MIN_INTERVAL_SEC, ip)
 
 
 def _chat_rate_limited() -> float:
@@ -1968,7 +2263,10 @@ def _session_append(session_id: str, role: str, content: str) -> None:
     sid = (session_id or "").strip()
     if not sid or not content:
         return
-    _cleanup_sessions()
+    global _session_append_count
+    _session_append_count += 1
+    if _session_append_count % 100 == 0:
+        _cleanup_sessions()
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         conn.execute(
@@ -2025,6 +2323,22 @@ def _session_get(session_id: str) -> Optional[Dict[str, Any]]:
         "updated_at": sess_row["updated_at"],
         "turns": [dict(r) for r in turns],
     }
+
+
+# ==============================================================================
+# ==== SELECTED KB DOC IDS (Server-side storage for cross-device sync) ========
+# ==============================================================================
+
+_server_selected_doc_ids: List[int] = []
+
+def _session_get_selected_doc_ids() -> List[int]:
+    """Return currently selected doc IDs stored server-side."""
+    return list(_server_selected_doc_ids)
+
+def _session_set_selected_doc_ids(ids: List[int]) -> None:
+    """Store selected doc IDs server-side for cross-device access."""
+    global _server_selected_doc_ids
+    _server_selected_doc_ids = ids
 
 
 # ==============================================================================
@@ -2119,8 +2433,8 @@ def db_cleanup():
                     
                     # Nếu cần, có thể implement cleanup trong vector_db
                     # Hiện tại chỉ log thôi
-                    cleanup_report["vector_index_rebuilt"] = True
-                    cleanup_report["notes"] = f"Vector index has {len(valid_chunk_ids)} valid chunks"
+                    cleanup_report["vector_index_rebuilt"] = False
+                    cleanup_report["notes"] = f"Vector index has {len(valid_chunk_ids)} valid chunks (rebuild not implemented)"
                 except Exception as e:
                     cleanup_report["errors"].append(f"Vector cleanup error: {e}")
         
@@ -2271,15 +2585,21 @@ def ask():
     question = data["question"].strip()
     subject  = data.get("subject", "").strip()
     doc_ids  = _parse_doc_ids(data.get("doc_ids"))
+    file_types = _normalize_file_types(data.get("file_types") or data.get("file_type") or [])
+    min_chunk_tokens = int(data.get("min_chunk_tokens", 0) or 0)
+    max_chunk_tokens = int(data.get("max_chunk_tokens", 0) or 0)
     top_k    = int(data.get("top_k", TOP_K))
     expand   = bool(data.get("expand", False))
     agentic  = bool(data.get("agentic", RAG_AGENTIC_DEFAULT))
     filter_k = int(data.get("filter_top_k", RAG_FILTER_TOP_K) or RAG_FILTER_TOP_K)
 
-    print(f"[ASK] '{question[:80]}' subject={subject!r} doc_ids={doc_ids[:8]} expand={expand} agentic={agentic}")
+    print(f"[ASK] '{question[:80]}' subject={subject!r} doc_ids={doc_ids[:8]} file_types={sorted(file_types)[:6]} expand={expand} agentic={agentic}")
 
     chunks = semantic_search(question, subject=subject or None,
                              doc_ids=doc_ids or None,
+                             file_types=sorted(file_types) if file_types else None,
+                             min_chunk_tokens=min_chunk_tokens,
+                             max_chunk_tokens=max_chunk_tokens,
                              top_k=top_k, expand=expand)
     pipeline = None
     if agentic:
@@ -2309,6 +2629,9 @@ def ask():
                 "query": question,
                 "subject": subject,
                     "doc_ids": doc_ids,
+                "file_types": sorted(file_types),
+                "min_chunk_tokens": min_chunk_tokens,
+                "max_chunk_tokens": max_chunk_tokens,
                 "top_k": top_k,
                 "retrieved_count": len(chunks),
                 "mode": mode,
@@ -2384,13 +2707,24 @@ def kb_upload():
             # Create the document row immediately so the upload is visible in the list,
             # then finish chunking/indexing in the background.
             try:
-                with get_db() as conn:
-                    cur = conn.execute(
+                import sqlite3 as _sqlite3
+                _pre_conn = _sqlite3.connect(str(DB_PATH), timeout=SQLITE_TIMEOUT_SEC)
+                _pre_conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_MS}")
+                _pre_conn.execute("PRAGMA foreign_keys = ON")
+                _pre_conn.execute("PRAGMA journal_mode = WAL")
+                try:
+                    cur = _pre_conn.execute(
                         "INSERT INTO documents (filename, original_name, file_type, subject, upload_date, file_size) VALUES (?,?,?,?,?,?)",
                         (filename, display_name, ftype or 'auto', subj, datetime.now().isoformat(), size_bytes)
                     )
                     doc_id = cur.lastrowid
-                    conn.commit()
+                    _pre_conn.commit()
+                except Exception as e:
+                    _pre_conn.close()
+                    print(f"[KB upload] pre-insert document failed: {e}")
+                    return _json_error(f"Processing failed: {e}", 500, code="kb_processing_failed")
+                finally:
+                    _pre_conn.close()
             except Exception as e:
                 print(f"[KB upload] pre-insert document failed: {e}")
                 return _json_error(f"Processing failed: {e}", 500, code="kb_processing_failed")
@@ -2401,6 +2735,9 @@ def kb_upload():
             def _bg(ctx):
                 with ctx:
                     try:
+                        _set_ingest_status(doc_id, "queued", "Đã upload, đang chờ xử lý nền...", 1)
+                        import time as _time
+                        _time.sleep(0.2)   # ensure pre-insert commit is visible
                         res = ingest_document_from_path(dst, original_name=display_name, file_type=ftype or 'auto', subject=subj, doc_id=doc_id)
                         print(f"[KB upload bg] success for {dst}: {res.get('chunks')} chunks indexed.")
                     except Exception as e:
@@ -2522,6 +2859,12 @@ def kb_manage_document(doc_id):
         doc["chunks"] = [dict(r) for r in chunk_rows]
         doc["chunk_count"] = len(chunk_rows)
         doc["vector_count"] = int(vector_count)
+        ingest_status = _get_ingest_status(doc_id)
+        if ingest_status:
+            doc["ingest_status"] = ingest_status
+            doc["ingest_stage"] = ingest_status.get("stage", "")
+            doc["ingest_message"] = ingest_status.get("message", "")
+            doc["ingest_progress"] = int(ingest_status.get("progress", 0) or 0)
         return jsonify(doc)
     
     elif request.method == "PUT":
@@ -2588,10 +2931,12 @@ def kb_get_document_chunks(doc_id):
         
         # Lấy chunks theo trang
         chunks = conn.execute(
-            """SELECT id, chunk_idx, text, subject 
-               FROM chunks 
-               WHERE doc_id=? 
-               ORDER BY chunk_idx 
+            """SELECT c.id, c.chunk_idx, c.text, c.subject, c.token_count, c.char_count, c.chunk_hash,
+                      d.file_type, d.original_name
+               FROM chunks c
+               JOIN documents d ON d.id = c.doc_id
+               WHERE c.doc_id=?
+               ORDER BY c.chunk_idx
                LIMIT ? OFFSET ?""",
             (doc_id, page_size, offset)
         ).fetchall()
@@ -2792,6 +3137,22 @@ def _chat_core(data: dict, force_stream: bool = False):
                         "safe_mode": True,
                         "fallback_error": str(e),
                         "kb_context": kb_context if data.get("debug") else None})
+
+
+@app.route("/kb/selected-docs", methods=["GET"])
+def kb_get_selected_docs():
+    """Return currently selected doc IDs stored server-side."""
+    ids = _session_get_selected_doc_ids()
+    return jsonify({"doc_ids": ids})
+
+
+@app.route("/kb/selected-docs", methods=["POST"])
+def kb_set_selected_docs():
+    """Store selected doc IDs server-side so browser can read them."""
+    data = request.get_json(force=True, silent=True) or {}
+    ids = [int(x) for x in (data.get('doc_ids') or []) if str(x).strip().lstrip('-').isdigit()]
+    _session_set_selected_doc_ids(ids)
+    return jsonify({"ok": True, "doc_ids": ids})
 
 
 @app.route("/session", methods=["GET"])
@@ -3186,6 +3547,12 @@ def start_dalap_server():
     except Exception:
         local_ip = "localhost"
 
+    try:
+        host_name = socket.gethostname().strip().split('.')[0]
+    except Exception:
+        host_name = "dalap"
+    host_name = host_name or "dalap"
+
     force_http = os.getenv("RESFES_FORCE_HTTP", "false").strip().lower() in {"1", "true", "yes"}
     public_url = os.getenv("RESFES_PUBLIC_URL", "").strip()
     cert_default = str((DATA_DIR / "certs").resolve())
@@ -3232,6 +3599,8 @@ def start_dalap_server():
             print("🔒 Certificate hợp lệ, dùng lại.")
 
     proto = "https" if cert_file and os.path.exists(cert_file) else "http"
+    stable_host_url = f"{proto}://{host_name}:{PORT}"
+    stable_mdns_url = f"{proto}://{host_name}.local:{PORT}"
 
     print(f"""
 ╔══════════════════════════════════════════════════╗
@@ -3239,6 +3608,8 @@ def start_dalap_server():
 ╠══════════════════════════════════════════════════╣
 ║  💻  {proto}://localhost:{PORT}
 ║  📱  {proto}://{local_ip}:{PORT}
+║  🔗  {stable_mdns_url}
+║  🏷️  {stable_host_url}
 ║  🌍  {public_url or '(not set)'}
 ║                                                  ║
 ║  POST /analyze  → Vision OCR + Socratic hint     ║
